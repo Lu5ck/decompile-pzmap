@@ -57,6 +57,7 @@
  *       --pzw       <name>                           (WorldEd project filename, no extension;
  *                                                     default "untitled" → untitled.pzw)
  *
+ *       --objects   <objects.lua>                 (optional: zone/object file → imported into .pzw)
  *   Without --tilesets or --tilesdir, tileset block sizes are computed from the tile
  *   names in the lotheader. The result is a self-consistent TMX that renders correctly
  *   in TileZed/WorldEd but may have different firstGid values from other cells.
@@ -214,6 +215,37 @@ public class run {
             // PZW project name: --pzw <name> (no extension), default "untitled".
             String pzwName = opts.getOrDefault("pzw", "untitled");
 
+            // Optional objects.lua: zone/object data imported into .pzw.
+            // Resolution order:
+            //   1. --objects <path>  explicit path
+            //   2. <mapdir>/objects.lua  auto-detected if present
+            //   3. nothing (zones omitted — always valid, not an error)
+            List<LuaZone> luaZones = new ArrayList<>();
+            {
+                Path objPath = null;
+                if (opts.containsKey("objects")) {
+                    objPath = Path.of(opts.get("objects"));
+                    if (!Files.exists(objPath)) {
+                        System.err.println("WARNING: --objects file not found: " + objPath + " — skipping zones.");
+                        objPath = null;
+                    }
+                } else {
+                    Path candidate = mapDir.resolve("objects.lua");
+                    if (Files.exists(candidate)) {
+                        objPath = candidate;
+                        log("  Auto-detected " + candidate.getFileName() + " in map folder.");
+                    }
+                }
+                if (objPath != null) {
+                    try {
+                        luaZones = parseLuaObjects(Files.readString(objPath));
+                        log("  Loaded " + luaZones.size() + " zone(s) from " + objPath.getFileName());
+                    } catch (Exception e) {
+                        System.err.println("WARNING: Could not parse objects.lua: " + e.getMessage() + " — skipping zones.");
+                    }
+                }
+            }
+
             // Discover all lotheader files; each one defines a cell.
             List<Path> lotheaders;
             try (var ds = Files.newDirectoryStream(mapDir, "*.lotheader")) {
@@ -270,7 +302,7 @@ public class run {
 
             // Write the WorldEd project file (.pzw).
             Path pzwPath = outDir.resolve(pzwName + ".pzw");
-            writePzw(pzwPath, pzwName, processedCells, minCX, minCY, maxCX, maxCY, outDir);
+            writePzw(pzwPath, pzwName, processedCells, minCX, minCY, maxCX, maxCY, outDir, luaZones);
 
             log("\nDone. " + processed + " cell(s) written"
                 + (failed > 0 ? ", " + failed + " skipped/failed" : "")
@@ -289,7 +321,8 @@ public class run {
             System.err.println("    --mapdir    <folder with X_Y.lotheader + world_X_Y.lotpack files> \\");
             System.err.println("    --tilesets  <any existing MyMap_X_Y.tmx from this project> \\");
             System.err.println("    [--output   <output folder, default: same as --mapdir>] \\\\");
-            System.err.println("    [--pzw      <project name, no extension, default: untitled>]");
+            System.err.println("    [--pzw      <project name, no extension, default: untitled>] \\\\");
+            System.err.println("    [--objects  <objects.lua path, optional>]");
             System.err.println();
             System.err.println("Usage (single-cell file mode):");
             System.err.println("  java run.java \\");
@@ -1150,10 +1183,306 @@ public class run {
      * @param maxCX,maxCY   largest  cell X and Y
      * @param outDir        output directory (maps/ subfolder created here)
      */
-    static void writePzw(Path pzwPath, String pzwName,
+    // ── objects.lua zone support ─────────────────────────────────────────────
+
+    /** A single zone entry parsed from objects.lua. */
+    static class LuaZone {
+        String type;       // e.g. "TownZone", "Nav", "Forest"
+        String name;       // may be empty
+        int    level;      // z-level (almost always 0)
+        // Geometry: always stored as a flat list of world-coord tile points.
+        // For rect objects: 4 points representing the corners.
+        // For polygon/polyline: the actual polygon vertices.
+        List<long[]> points; // each element is {worldX, worldY}
+        boolean isRect;    // true if originated from x/y/w/h rect form
+    }
+
+    /**
+     * Parse an objects.lua file as produced by WorldEd's LuaWriter::writeWorldObjects().
+     *
+     * The file is a Lua table:
+     *   objects = {
+     *     {name="", type="TownZone", x=WX, y=WY, z=0, width=W, height=H},
+     *     {name="", type="Nav",      z=0, geometry="polygon", points={x1,y1,x2,y2,...}},
+     *   }
+     *
+     * We do a best-effort parse using regex rather than a full Lua interpreter,
+     * which is sufficient for the well-structured output that WorldEd produces.
+     */
+    static List<LuaZone> parseLuaObjects(String lua) {
+        List<LuaZone> zones = new ArrayList<>();
+
+        // Strip comments and find the top-level "objects = { ... }" table.
+        // WorldEd writes the table at the top level (no function wrapper in writeWorldObjects).
+        // Each entry is one table on its own line(s): { key=val, ... }
+        // We find each { ... } block (handling nested braces for the points table).
+        // First, locate where the entries begin (skip "objects = {" header line).
+        int start = lua.indexOf('{');
+        if (start < 0) return zones;
+        // Skip the outer opening brace
+        start++;
+        int end = lua.lastIndexOf('}');
+        if (end <= start) return zones;
+        String body = lua.substring(start, end);
+
+        // Split into individual zone entry blocks by finding balanced { } pairs.
+        List<String> entries = splitLuaTableEntries(body);
+
+        for (String entry : entries) {
+            entry = entry.trim();
+            if (entry.isEmpty() || entry.equals(",")) continue;
+            // Remove leading/trailing braces and commas
+            // Strip exactly one outermost { } pair, plus leading/trailing commas.
+            if (entry.startsWith("{")) entry = entry.substring(1);
+            if (entry.endsWith("}"))   entry = entry.substring(0, entry.length() - 1);
+            entry = entry.strip().replaceAll("^,|,$", "").strip();
+            if (entry.isEmpty()) continue;
+
+            LuaZone z = new LuaZone();
+            z.name   = luaStringField(entry, "name", "");
+            z.type   = luaStringField(entry, "type", "");
+            z.level  = (int) luaNumberField(entry, "z",     0);
+            if (z.type.isEmpty()) continue;
+
+            // Check for geometry type
+            String geom = luaStringField(entry, "geometry", "");
+            if (!geom.isEmpty()) {
+                // Polygon / polyline form: points = {x1,y1,x2,y2,...}
+                z.isRect = false;
+                z.points = parseLuaPoints(entry);
+            } else {
+                // Rect form: x, y, width, height (all in world tile coordinates)
+                long wx = (long) luaNumberField(entry, "x", 0);
+                long wy = (long) luaNumberField(entry, "y", 0);
+                long ww = (long) luaNumberField(entry, "width",  0);
+                long wh = (long) luaNumberField(entry, "height", 0);
+                z.isRect = true;
+                // Store as 4 corner points (clockwise from top-left)
+                z.points = List.of(
+                    new long[]{wx,      wy     },
+                    new long[]{wx + ww, wy     },
+                    new long[]{wx + ww, wy + wh},
+                    new long[]{wx,      wy + wh}
+                );
+            }
+            if (!z.points.isEmpty()) zones.add(z);
+        }
+        return zones;
+    }
+
+    /** Split a Lua table body into individual entry strings, respecting nested braces. */
+    static List<String> splitLuaTableEntries(String body) {
+        List<String> entries = new ArrayList<>();
+        int depth = 0, start = -1;
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '{') {
+                if (depth == 0) start = i;
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0 && start >= 0) {
+                    entries.add(body.substring(start, i + 1));
+                    start = -1;
+                }
+            }
+        }
+        return entries;
+    }
+
+    /** Extract a string value from a Lua table entry: key = "value" or key = 'value' */
+    static String luaStringField(String entry, String key, String def) {
+        Pattern p = Pattern.compile("\\b" + Pattern.quote(key) + "\\s*=\\s*[\"']([^\"']*)[\"']");
+        Matcher m = p.matcher(entry);
+        return m.find() ? m.group(1) : def;
+    }
+
+    /** Extract a numeric value from a Lua table entry: key = number */
+    static double luaNumberField(String entry, String key, double def) {
+        Pattern p = Pattern.compile("\\b" + Pattern.quote(key) + "\\s*=\\s*(-?[\\d.]+)");
+        Matcher m = p.matcher(entry);
+        if (m.find()) { try { return Double.parseDouble(m.group(1)); } catch (NumberFormatException e) {} }
+        return def;
+    }
+
+    /**
+     * Parse the points sub-table from a polygon entry:
+     *   points = {x1, y1, x2, y2, ...}
+     * Returns list of [worldX, worldY] pairs.
+     */
+    static List<long[]> parseLuaPoints(String entry) {
+        List<long[]> pts = new ArrayList<>();
+        // Find "points = { ... }"
+        int ps = entry.indexOf("points");
+        if (ps < 0) return pts;
+        int pb = entry.indexOf('{', ps);
+        if (pb < 0) return pts;
+        int pe = entry.lastIndexOf('}');
+        if (pe <= pb) return pts;
+        String inner = entry.substring(pb + 1, pe);
+        // Split by comma and parse alternating x,y pairs
+        String[] nums = inner.split("[,\\s]+");
+        List<Long> vals = new ArrayList<>();
+        for (String n : nums) {
+            n = n.trim();
+            if (n.isEmpty()) continue;
+            try { vals.add((long) Double.parseDouble(n)); } catch (NumberFormatException e) {}
+        }
+        for (int i = 0; i + 1 < vals.size(); i += 2)
+            pts.add(new long[]{vals.get(i), vals.get(i + 1)});
+        return pts;
+    }
+
+    /**
+     * Assign each zone to the cell it overlaps the most (by tile area).
+     *
+     * Strategy:
+     *   1. Compute the world-coordinate bounding box of the zone's points.
+     *   2. For each cell the bbox overlaps, compute the overlap area of the zone's
+     *      BBOX with that cell's 300×300 tile area.
+     *   3. Assign the zone to the cell with the largest overlap.
+     *   4. Convert the zone's world coordinates to cell-local [0,300) coords.
+     *   5. Emit a PZW <object> XML line for that cell.
+     *
+     * Returns a map from "cellX_cellY" → list of <object ...> lines.
+     *
+     * @param luaZones   zones from objects.lua (world-coordinate points)
+     * @param minCX/maxCX/minCY/maxCY  known cell extent (all cells in project)
+     */
+    static Map<String, List<String>> assignZonesToCells(
+            List<LuaZone> luaZones, int minCX, int minCY, int maxCX, int maxCY) {
+
+        Map<String, List<String>> result = new LinkedHashMap<>();
+        int skipped = 0;
+
+        for (LuaZone z : luaZones) {
+            if (z.points.isEmpty()) { skipped++; continue; }
+
+            // Compute world-coordinate bounding box
+            long minWX = Long.MAX_VALUE, maxWX = Long.MIN_VALUE;
+            long minWY = Long.MAX_VALUE, maxWY = Long.MIN_VALUE;
+            for (long[] pt : z.points) {
+                minWX = Math.min(minWX, pt[0]); maxWX = Math.max(maxWX, pt[0]);
+                minWY = Math.min(minWY, pt[1]); maxWY = Math.max(maxWY, pt[1]);
+            }
+
+            // Find the cell with maximum bbox overlap
+            int bestCX = -1, bestCY = -1;
+            long bestArea = -1;
+            for (int cx = minCX; cx <= maxCX; cx++) {
+                for (int cy = minCY; cy <= maxCY; cy++) {
+                    long cellMinWX = (long) cx * 300;
+                    long cellMinWY = (long) cy * 300;
+                    long cellMaxWX = cellMinWX + 300;
+                    long cellMaxWY = cellMinWY + 300;
+                    long ox = Math.max(0, Math.min(maxWX, cellMaxWX) - Math.max(minWX, cellMinWX));
+                    long oy = Math.max(0, Math.min(maxWY, cellMaxWY) - Math.max(minWY, cellMinWY));
+                    long area = ox * oy;
+                    if (area > bestArea) {
+                        bestArea = area;
+                        bestCX = cx;
+                        bestCY = cy;
+                    }
+                }
+            }
+            if (bestCX < 0 || bestArea <= 0) { skipped++; continue; }
+
+            // Convert world coords to cell-local coords
+            long originX = (long) bestCX * 300;
+            long originY = (long) bestCY * 300;
+
+            // Build the "points" string: "x1,y1 x2,y2 ..."
+            StringBuilder pts = new StringBuilder();
+            for (int i = 0; i < z.points.size(); i++) {
+                if (i > 0) pts.append(' ');
+                long lx = z.points.get(i)[0] - originX;
+                long ly = z.points.get(i)[1] - originY;
+                pts.append(lx).append(',').append(ly);
+            }
+
+            String typeEsc = xmlEsc(z.type);
+            String line = "  <object group=\"" + typeEsc + "\" type=\"" + typeEsc
+                        + "\" level=\"" + z.level + "\" geometry=\"polygon\""
+                        + " points=\"" + pts + "\"/>\n";
+
+            String cellKey = bestCX + "_" + bestCY;
+            result.computeIfAbsent(cellKey, k -> new ArrayList<>()).add(line);
+        }
+
+        if (skipped > 0)
+            System.err.println("WARNING: " + skipped + " zone(s) could not be assigned to any cell — skipped.");
+        return result;
+    }
+
+    /**
+     * Build the <objecttype> and <objectgroup> XML block for the PZW.
+     *
+     * The known types have curated colors; any extra types found in the
+     * imported zones that are not already in the known set are appended
+     * with no color attribute (WorldEd accepts this fine).
+     */
+    static String buildObjectTypesAndGroups(List<LuaZone> luaZones) {
+        // Ordered known types: name → color (null = no color attribute)
+        // Order matches the zone_example.pzw reference.
+        String[][] KNOWN = {
+            {"TownZone",    "#aa0000"},
+            {"Forest",      "#00aa00"},
+            {"DeepForest",  "#003500"},
+            {"Nav",         "#55aaff"},
+            {"Vegitation",  "#b3b300"},
+            {"TrailerPark", "#f50000"},
+            {"Farm",        "#55ff7f"},
+            {"ParkingStall","#ff007f"},
+            {"FarmLand",    "#bcff7d"},
+            {"WaterFlow",   "#0000ff"},
+            {"WaterZone",   "#0000ff"},
+            {"Mannequin",   "#0000ff"},
+            {"RoomTone",    "#0000ff"},
+            {"SpawnPoint",  null},
+            {"ZombiesType", "#ffffff"},
+            {"ZoneStory",   "#8080ff"},
+            {"LootZone",    "#80ff80"},
+            {"WorldGen",    "#ffaa00"},
+            {"ForagingNav", "#66ddff"},
+            {"Foraging_None","#000000"},
+            {"Water",       "#0006ff"},
+            {"WaterNoFish", "#6ad600"},
+            {"Ranch",       "#ff8000"},
+            {"Animal",      null},
+            {"Basement",    null},
+        };
+
+        // Build ordered set of known names for fast lookup.
+        LinkedHashMap<String, String> types = new LinkedHashMap<>();
+        for (String[] kv : KNOWN) types.put(kv[0], kv[1]);
+
+        // Collect any extra types from zones not already in the known set,
+        // preserving first-seen order.
+        for (LuaZone z : luaZones) {
+            if (z.type != null && !z.type.isEmpty() && !types.containsKey(z.type))
+                types.put(z.type, null); // no color for unknown types
+        }
+
+        StringBuilder sb = new StringBuilder();
+        // <objecttype> block
+        for (String name : types.keySet())
+            sb.append(" <objecttype name=\"" + xmlEsc(name) + "\"/>\n");
+        // <objectgroup> block
+        for (Map.Entry<String, String> e : types.entrySet()) {
+            String eName = xmlEsc(e.getKey());
+            String grp = " <objectgroup name=\"" + eName + "\"";
+            if (e.getValue() != null) grp += " color=\"" + e.getValue() + "\"";
+            grp += " defaulttype=\"" + eName + "\"/>\n";
+            sb.append(grp);
+        }
+        return sb.toString();
+    }
+
+        static void writePzw(Path pzwPath, String pzwName,
                          List<int[]> cells,
                          int minCX, int minCY, int maxCX, int maxCY,
-                         Path outDir) throws IOException {
+                         Path outDir,
+                         List<LuaZone> luaZones) throws IOException {
 
         // World grid dimensions (number of cells wide / tall).
         int worldW = maxCX - minCX + 1;
@@ -1173,6 +1502,10 @@ public class run {
                 + " in WorldEd and correct it under GenerateLots > TileDefFolder.");
         }
 
+        // Assign each zone to the cell it overlaps most.
+        // key = "cellX_cellY", value = list of <object ...> XML lines for that cell
+        Map<String, List<String>> zonesByCell = assignZonesToCells(luaZones, minCX, minCY, maxCX, maxCY);
+
         // Build <cell> entries — normalise world coords so top-left = (0,0).
         StringBuilder cellLines = new StringBuilder();
         // Sort cells x-major then y for a tidy file.
@@ -1181,9 +1514,19 @@ public class run {
             int nx = cc[0] - minCX;   // normalised grid x (0-based)
             int ny = cc[1] - minCY;   // normalised grid y (0-based)
             String tmxName = "MyMap_" + cc[0] + "_" + cc[1] + ".tmx";
-            cellLines.append(" <cell x=\"").append(nx)
-                     .append("\" y=\"").append(ny)
-                     .append("\" map=\"").append(tmxName).append("\"/>\n");
+            String cellKey = cc[0] + "_" + cc[1];
+            List<String> zoneLines = zonesByCell.getOrDefault(cellKey, List.of());
+            if (zoneLines.isEmpty()) {
+                cellLines.append(" <cell x=\"").append(nx)
+                         .append("\" y=\"").append(ny)
+                         .append("\" map=\"").append(tmxName).append("\"/>\n");
+            } else {
+                cellLines.append(" <cell x=\"").append(nx)
+                         .append("\" y=\"").append(ny)
+                         .append("\" map=\"").append(tmxName).append("\">\n");
+                for (String zl : zoneLines) cellLines.append(zl);
+                cellLines.append(" </cell>\n");
+            }
         }
 
         // Assemble the full PZW XML, modelled on the 1x2.pzw sample.
@@ -1271,32 +1614,7 @@ public class run {
           + "  <property name=\"RoomTone\" value=\"Generic\"/>\n"
           + "  <property name=\"EntireBuilding\" value=\"false\"/>\n"
           + " </template>\n"
-          + " <objecttype name=\"TownZone\"/>\n"
-          + " <objecttype name=\"Forest\"/>\n"
-          + " <objecttype name=\"DeepForest\"/>\n"
-          + " <objecttype name=\"Nav\"/>\n"
-          + " <objecttype name=\"Vegitation\"/>\n"
-          + " <objecttype name=\"TrailerPark\"/>\n"
-          + " <objecttype name=\"Farm\"/>\n"
-          + " <objecttype name=\"ParkingStall\"/>\n"
-          + " <objecttype name=\"FarmLand\"/>\n"
-          + " <objecttype name=\"WaterFlow\"/>\n"
-          + " <objecttype name=\"WaterZone\"/>\n"
-          + " <objecttype name=\"Mannequin\"/>\n"
-          + " <objecttype name=\"RoomTone\"/>\n"
-          + " <objectgroup name=\"ParkingStall\" color=\"#ff007f\" defaulttype=\"ParkingStall\"/>\n"
-          + " <objectgroup name=\"TownZone\" color=\"#aa0000\" defaulttype=\"TownZone\"/>\n"
-          + " <objectgroup name=\"Forest\" color=\"#00aa00\" defaulttype=\"Forest\"/>\n"
-          + " <objectgroup name=\"Nav\" color=\"#55aaff\" defaulttype=\"Nav\"/>\n"
-          + " <objectgroup name=\"DeepForest\" color=\"#003500\" defaulttype=\"DeepForest\"/>\n"
-          + " <objectgroup name=\"Vegitation\" color=\"#b3b300\" defaulttype=\"Vegitation\"/>\n"
-          + " <objectgroup name=\"TrailerPark\" color=\"#f50000\" defaulttype=\"TrailerPark\"/>\n"
-          + " <objectgroup name=\"Farm\" color=\"#55ff7f\" defaulttype=\"Farm\"/>\n"
-          + " <objectgroup name=\"FarmLand\" color=\"#bcff7d\" defaulttype=\"FarmLand\"/>\n"
-          + " <objectgroup name=\"WaterFlow\" color=\"#0000ff\" defaulttype=\"WaterFlow\"/>\n"
-          + " <objectgroup name=\"WaterZone\" color=\"#0000ff\" defaulttype=\"WaterZone\"/>\n"
-          + " <objectgroup name=\"Mannequin\" color=\"#0000ff\" defaulttype=\"Mannequin\"/>\n"
-          + " <objectgroup name=\"RoomTone\" color=\"#0000ff\" defaulttype=\"RoomTone\"/>\n"
+          + buildObjectTypesAndGroups(luaZones)
           + cellLines
           + "</world>\n";
 
