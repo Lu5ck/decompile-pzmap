@@ -34,17 +34,18 @@
  *    </layer>
  *
  * ── Usage ────────────────────────────────────────────────────────────────────
- *   Folder mode (recommended) — point at the folder containing the lot files:
+ *   Map folder mode (recommended) — processes ALL cells in a map directory:
  *     java run.java \
- *       --celldir   path/to/cell/folder \
+ *       --mapdir    path/to/map/folder \
  *       --tilesdir  "Steam/.../Project Zomboid Modding Tools/Tiles" \
- *       [--output   MyMap_0_0.tmx]
+ *       [--output   path/to/output/folder]
  *
- *   The folder must contain exactly one X_Y.lotheader and one world_X_Y.lotpack.
- *   Output is MyMap_X_Y.tmx next to the cell folder (or at --output path).
- *   Buildings are written as  <outdir>/buildings/X_Y_building_i.tbx
+ *   The map folder must contain files named X_Y.lotheader and world_X_Y.lotpack
+ *   (and optionally chunkdata_X_Y.bin) for each cell X,Y.  Every cell found is
+ *   processed and produces MyMap_X_Y.tmx in the output folder (default: same as
+ *   --mapdir).  Buildings go in <outdir>/buildings/X_Y_building_i.tbx.
  *
- *   Individual file mode:
+ *   Individual file mode (single cell):
  *     java run.java \
  *       --lotheader  0_0.lotheader \
  *       --lotpack    world_0_0.lotpack \
@@ -187,28 +188,73 @@ public class run {
     public static void main(String[] args) throws Exception {
         Map<String, String> opts = parseArgs(args);
 
-        // Resolve input paths — folder mode takes priority
+        Path tilesDir    = opts.containsKey("tilesdir") ? Path.of(opts.get("tilesdir")) : null;
+        Path tilesetsRef = opts.containsKey("tilesets") ? Path.of(opts.get("tilesets")) : null;
+
+        // ── Map-folder mode: process every cell found in the directory ─────────
+        if (opts.containsKey("mapdir")) {
+            Path mapDir = Path.of(opts.get("mapdir"));
+            if (!Files.isDirectory(mapDir))
+                die("--mapdir is not a directory: " + mapDir);
+
+            // Output folder: --output overrides, otherwise same as mapdir.
+            Path outDir = opts.containsKey("output") ? Path.of(opts.get("output")) : mapDir;
+            Files.createDirectories(outDir);
+
+            // Discover all lotheader files; each one defines a cell.
+            List<Path> lotheaders;
+            try (var ds = Files.newDirectoryStream(mapDir, "*.lotheader")) {
+                lotheaders = new ArrayList<>();
+                ds.forEach(lotheaders::add);
+            }
+            // Sort for deterministic processing order (e.g. 0_0 before 1_0 before 0_1).
+            lotheaders.sort((a, b) -> {
+                int[] ca = parseCellCoords(a.getFileName().toString());
+                int[] cb = parseCellCoords(b.getFileName().toString());
+                return ca[0] != cb[0] ? Integer.compare(ca[0], cb[0]) : Integer.compare(ca[1], cb[1]);
+            });
+            if (lotheaders.isEmpty())
+                die("No *.lotheader files found in: " + mapDir);
+
+            log("Found " + lotheaders.size() + " cell(s) in " + mapDir);
+            int processed = 0, failed = 0;
+            for (Path lh : lotheaders) {
+                int[] cc = parseCellCoords(lh.getFileName().toString());
+                String cellTag = cc[0] + "_" + cc[1];
+                // Expect world_X_Y.lotpack alongside the lotheader.
+                Path lp = mapDir.resolve("world_" + cellTag + ".lotpack");
+                if (!Files.exists(lp)) {
+                    System.err.println("WARNING: No lotpack for " + lh.getFileName() + " (expected " + lp.getFileName() + ") — skipping.");
+                    failed++;
+                    continue;
+                }
+                Path outTmx = outDir.resolve("MyMap_" + cellTag + ".tmx");
+                try {
+                    log("\n== Cell " + cellTag + " ==================================");
+                    processCell(lh, lp, outTmx, tilesDir, tilesetsRef);
+                    processed++;
+                } catch (Exception e) {
+                    System.err.println("ERROR processing cell " + cellTag + ": " + e.getMessage());
+                    failed++;
+                }
+            }
+            log("\nDone. " + processed + " cell(s) written" + (failed > 0 ? ", " + failed + " skipped/failed" : "") + ".");
+            return;
+        }
+
+        // ── Single-cell file mode ─────────────────────────────────────────────
         Path lotheaderPath, lotpackPath;
-
-        if (opts.containsKey("celldir")) {
-            Path cellDir = Path.of(opts.get("celldir"));
-            if (!Files.isDirectory(cellDir))
-                die("--celldir is not a directory: " + cellDir);
-            lotheaderPath = findOne(cellDir, "*.lotheader",  "lotheader");
-            lotpackPath   = findOne(cellDir, "world_*.lotpack", "lotpack");
-
-        } else if (opts.containsKey("lotheader") && opts.containsKey("lotpack")) {
+        if (opts.containsKey("lotheader") && opts.containsKey("lotpack")) {
             lotheaderPath = Path.of(opts.get("lotheader"));
             lotpackPath   = Path.of(opts.get("lotpack"));
-
         } else {
-            System.err.println("Usage (folder mode — recommended):");
+            System.err.println("Usage (map folder mode — processes all cells):");
             System.err.println("  java run.java \\");
-            System.err.println("    --celldir   <folder containing X_Y.lotheader + world_X_Y.lotpack> \\");
+            System.err.println("    --mapdir    <folder with X_Y.lotheader + world_X_Y.lotpack files> \\");
             System.err.println("    --tilesets  <any existing MyMap_X_Y.tmx from this project> \\");
-            System.err.println("    [--output   <MyMap_X_Y.tmx>]");
+            System.err.println("    [--output   <output folder, default: same as --mapdir>]");
             System.err.println();
-            System.err.println("Usage (file mode):");
+            System.err.println("Usage (single-cell file mode):");
             System.err.println("  java run.java \\");
             System.err.println("    --lotheader <X_Y.lotheader> \\");
             System.err.println("    --lotpack   <world_X_Y.lotpack> \\");
@@ -219,17 +265,21 @@ public class run {
             System.exit(1);
             return;
         }
+        String outName = opts.getOrDefault("output", deriveOutputName(lotheaderPath));
+        processCell(lotheaderPath, lotpackPath, Path.of(outName), tilesDir, tilesetsRef);
+        log("\nDone! Open " + outName + " in WorldEd / TileZed.");
+    }
+
+    // ── processCell: convert one (lotheader, lotpack) pair → TMX + TBX files ─
+
+    static void processCell(Path lotheaderPath, Path lotpackPath, Path outPath,
+                            Path tilesDir, Path tilesetsRef) throws Exception {
 
         // Parse cell coordinates from the lotheader filename: "X_Y.lotheader"
         int[] cellCoords = parseCellCoords(lotheaderPath.getFileName().toString());
-        int cellX = cellCoords[0];  // world-space cell X (used to normalize tile coords)
+        int cellX = cellCoords[0];  // world-space cell X (used to normalise tile coords)
         int cellY = cellCoords[1];
         log("      Cell coordinates: " + cellX + "," + cellY);
-
-        Path tilesDir    = opts.containsKey("tilesdir") ? Path.of(opts.get("tilesdir")) : null;
-        Path tilesetsRef = opts.containsKey("tilesets") ? Path.of(opts.get("tilesets")) : null;
-        String outName   = opts.getOrDefault("output", deriveOutputName(lotheaderPath));
-        Path   outPath   = Path.of(outName);
 
         // 1 — lotheader
         log("[1/5] Parsing " + lotheaderPath + " ...");
@@ -276,13 +326,10 @@ public class run {
         log("      Grid decoded: " + cellW + " x " + cellH + " tiles");
 
         // 4 — extract buildings, write .tbx files, erase building tiles from grid
-        // The lotheader stores room rects in world tile space (cellX*300 + localX).
-        // We normalise them to cell-local space [0, 300) for both the tbx and the
-        // lot object pixel coordinates.
-        int originX = cellX * CELL_TILES;  // world-space origin of this cell
-        int originY = cellY * CELL_TILES;
+        // NOTE: lotheader room rects are ALWAYS in cell-local tile space [0,300).
+        // No world-origin subtraction needed.
         log("[4/5] Extracting buildings ...");
-        List<BuildingData> buildings = extractBuildings(header, tiles, roomIds, originX, originY);
+        List<BuildingData> buildings = extractBuildings(header, tiles, roomIds);
 
         // .tbx files go in a "buildings" subfolder next to the output TMX.
         // Named  X_Y_building_i.tbx  so multiple cells can share one folder.
@@ -314,7 +361,6 @@ public class run {
         // 5 — write TMX (building tiles already erased from 'tiles' by extractBuildings)
         log("[5/5] Writing " + outPath + " ...");
         writeTmx(outPath, header, tiles, tilesetRegistry, lotEntries);
-        log("\nDone! Open " + outPath + " in WorldEd / TileZed.");
     }
 
     // ── Tiles folder scanner ──────────────────────────────────────────────────
@@ -535,7 +581,7 @@ public class run {
     //   4. Build building-local room grid (for .tbx <rooms> CSV).
     // Returns list of BuildingData objects, one per building.
 
-    static List<BuildingData> extractBuildings(LotHeader header, int[][][][] tiles, int[][][] roomIds, int originX, int originY) {
+    static List<BuildingData> extractBuildings(LotHeader header, int[][][][] tiles, int[][][] roomIds) {
         List<BuildingData> result = new ArrayList<>();
         int numLevels = header.numLevels;
         int cellH = roomIds[0].length;
@@ -560,12 +606,11 @@ public class run {
             for (int rid : header.buildings.get(bi).roomIDs) {
                 LotRoom room = header.rooms.get(rid);
                 for (int[] rc : room.rects) {
-                    // rc[0..1] are in world tile space; subtract cell origin to get local [0,300) coords.
-                    int lx = rc[0] - originX, ly = rc[1] - originY;
-                    minX[bi] = Math.min(minX[bi], lx);
-                    minY[bi] = Math.min(minY[bi], ly);
-                    maxX[bi] = Math.max(maxX[bi], lx + rc[2]);
-                    maxY[bi] = Math.max(maxY[bi], ly + rc[3]);
+                    // rc[0..1] are already in local cell space [0,300).
+                    minX[bi] = Math.min(minX[bi], rc[0]);
+                    minY[bi] = Math.min(minY[bi], rc[1]);
+                    maxX[bi] = Math.max(maxX[bi], rc[0] + rc[2]);
+                    maxY[bi] = Math.max(maxY[bi], rc[1] + rc[3]);
                 }
             }
         }
@@ -733,10 +778,9 @@ public class run {
                 bd.roomNames.add(room.name);
                 for (int[] rc : room.rects) {
                     int z = Math.min(room.floor, numLevels - 1);
-                    // rc[0..1] are world coords; subtract origin then minX/Y for building-local coords.
-                    int rcLx = rc[0] - originX, rcLy = rc[1] - originY;
-                    for (int ry2 = rcLy; ry2 < rcLy + rc[3]; ry2++) {
-                        for (int rx2 = rcLx; rx2 < rcLx + rc[2]; rx2++) {
+                    // rc[0..1] are already local cell coords; subtract building minX/Y for building-local.
+                    for (int ry2 = rc[1]; ry2 < rc[1] + rc[3]; ry2++) {
+                        for (int rx2 = rc[0]; rx2 < rc[0] + rc[2]; rx2++) {
                             int by = ry2 - minY[bi], bx = rx2 - minX[bi];
                             if (by >= 0 && by < bh && bx >= 0 && bx < bw)
                                 bd.roomGrid[z][by][bx] = localIdx;
@@ -1080,7 +1124,7 @@ public class run {
         // lotheader rr->x is in tile-width (64px) units: pixel_x = tile_x * MAP_TILE_W (64)
         // lotheader rr->y is in tile-height (32px) units: pixel_y = tile_y * MAP_TILE_H (32)
         if (lotEntries.isEmpty()) {
-            sb.append(" <objectgroup name=\"0_Lots\" width=\"300\" height=\"300\"\"/>\n");
+            sb.append(" <objectgroup name=\"0_Lots\" width=\"300\" height=\"300\"/>\n");
         } else {
             sb.append(" <objectgroup name=\"0_Lots\" width=\"300\" height=\"300\">\n");
             for (String entry : lotEntries) {
