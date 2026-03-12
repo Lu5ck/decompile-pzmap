@@ -54,6 +54,8 @@
  *   Optional for exact GID compatibility with an existing project:
  *       --tilesets  <any_existing_MyMap_X_Y.tmx>   (read tileset registry from existing TMX)
  *       --tilesdir  <Tiles folder>                   (scan Tiles folder for image dimensions)
+ *       --pzw       <name>                           (WorldEd project filename, no extension;
+ *                                                     default "untitled" → untitled.pzw)
  *
  *   Without --tilesets or --tilesdir, tileset block sizes are computed from the tile
  *   names in the lotheader. The result is a self-consistent TMX that renders correctly
@@ -201,13 +203,16 @@ public class run {
             Path outDir = opts.containsKey("output") ? Path.of(opts.get("output")) : mapDir;
             Files.createDirectories(outDir);
 
+            // PZW project name: --pzw <name> (no extension), default "untitled".
+            String pzwName = opts.getOrDefault("pzw", "untitled");
+
             // Discover all lotheader files; each one defines a cell.
             List<Path> lotheaders;
             try (var ds = Files.newDirectoryStream(mapDir, "*.lotheader")) {
                 lotheaders = new ArrayList<>();
                 ds.forEach(lotheaders::add);
             }
-            // Sort for deterministic processing order (e.g. 0_0 before 1_0 before 0_1).
+            // Sort for deterministic processing order (x-major, then y).
             lotheaders.sort((a, b) -> {
                 int[] ca = parseCellCoords(a.getFileName().toString());
                 int[] cb = parseCellCoords(b.getFileName().toString());
@@ -216,15 +221,30 @@ public class run {
             if (lotheaders.isEmpty())
                 die("No *.lotheader files found in: " + mapDir);
 
+            // Compute map extents from all cell coords.
+            int minCX = Integer.MAX_VALUE, minCY = Integer.MAX_VALUE;
+            int maxCX = Integer.MIN_VALUE, maxCY = Integer.MIN_VALUE;
+            List<int[]> allCoords = new ArrayList<>();
+            for (Path lh : lotheaders) {
+                int[] cc = parseCellCoords(lh.getFileName().toString());
+                allCoords.add(cc);
+                minCX = Math.min(minCX, cc[0]); minCY = Math.min(minCY, cc[1]);
+                maxCX = Math.max(maxCX, cc[0]); maxCY = Math.max(maxCY, cc[1]);
+            }
+
             log("Found " + lotheaders.size() + " cell(s) in " + mapDir);
+            log("  World extent: cells (" + minCX + "," + minCY + ") to (" + maxCX + "," + maxCY + ")");
+
+            // Process each cell: TMX + TBX files.
+            List<int[]> processedCells = new ArrayList<>();
             int processed = 0, failed = 0;
             for (Path lh : lotheaders) {
                 int[] cc = parseCellCoords(lh.getFileName().toString());
                 String cellTag = cc[0] + "_" + cc[1];
-                // Expect world_X_Y.lotpack alongside the lotheader.
                 Path lp = mapDir.resolve("world_" + cellTag + ".lotpack");
                 if (!Files.exists(lp)) {
-                    System.err.println("WARNING: No lotpack for " + lh.getFileName() + " (expected " + lp.getFileName() + ") — skipping.");
+                    System.err.println("WARNING: No lotpack for " + lh.getFileName()
+                        + " (expected " + lp.getFileName() + ") — skipping.");
                     failed++;
                     continue;
                 }
@@ -232,13 +252,21 @@ public class run {
                 try {
                     log("\n== Cell " + cellTag + " ==================================");
                     processCell(lh, lp, outTmx, tilesDir, tilesetsRef);
+                    processedCells.add(cc);
                     processed++;
                 } catch (Exception e) {
                     System.err.println("ERROR processing cell " + cellTag + ": " + e.getMessage());
                     failed++;
                 }
             }
-            log("\nDone. " + processed + " cell(s) written" + (failed > 0 ? ", " + failed + " skipped/failed" : "") + ".");
+
+            // Write the WorldEd project file (.pzw).
+            Path pzwPath = outDir.resolve(pzwName + ".pzw");
+            writePzw(pzwPath, pzwName, processedCells, minCX, minCY, maxCX, maxCY, outDir);
+
+            log("\nDone. " + processed + " cell(s) written"
+                + (failed > 0 ? ", " + failed + " skipped/failed" : "")
+                + ". Project: " + pzwPath);
             return;
         }
 
@@ -252,7 +280,8 @@ public class run {
             System.err.println("  java run.java \\");
             System.err.println("    --mapdir    <folder with X_Y.lotheader + world_X_Y.lotpack files> \\");
             System.err.println("    --tilesets  <any existing MyMap_X_Y.tmx from this project> \\");
-            System.err.println("    [--output   <output folder, default: same as --mapdir>]");
+            System.err.println("    [--output   <output folder, default: same as --mapdir>] \\\\");
+            System.err.println("    [--pzw      <project name, no extension, default: untitled>]");
             System.err.println();
             System.err.println("Usage (single-cell file mode):");
             System.err.println("  java run.java \\");
@@ -946,6 +975,316 @@ public class run {
         Files.writeString(out, sb, StandardCharsets.UTF_8);
     }
 
+
+    // ── PZW writer ────────────────────────────────────────────────────────────
+
+    /**
+     * Detect the ProjectZomboid/media folder inside a Steam installation.
+     * Returns null if not found; callers should warn and fall back to a dummy path.
+     */
+    // ── Steam detection ───────────────────────────────────────────────────────
+
+    /**
+     * Lightweight parser for Valve's KeyValues / VDF text format.
+     * Only handles the flat "key" "value" and nested "key" { ... } forms
+     * used in libraryfolders.vdf — no dependency on any external library.
+     */
+    static java.util.Map<String, String> parseVdfValues(String vdf) {
+        java.util.Map<String, String> values = new java.util.LinkedHashMap<>();
+        // Match   "key"   "value"  pairs (the flat entries we care about).
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("\"([^\"]+)\"\\s+\"([^\"]+)\"")
+            .matcher(vdf);
+        while (m.find())
+            values.put(m.group(1), m.group(2));
+        return values;
+    }
+
+    /**
+     * Extract all Steam library root paths from a libraryfolders.vdf file.
+     * Each numbered block (0, 1, 2 …) contains a "path" key.
+     */
+    static List<Path> parseSteamLibraries(Path vdfPath) {
+        List<Path> libs = new ArrayList<>();
+        try {
+            String vdf = Files.readString(vdfPath, java.nio.charset.StandardCharsets.UTF_8);
+            // Split on top-level numbered blocks: "0" { ... }
+            java.util.regex.Matcher blocks = java.util.regex.Pattern
+                .compile("\"\\d+\"\\s*\\{([^}]+)\\}")
+                .matcher(vdf);
+            while (blocks.find()) {
+                java.util.Map<String, String> kv = parseVdfValues(blocks.group(1));
+                String pathStr = kv.get("path");
+                if (pathStr != null) {
+                    Path p = Path.of(pathStr);
+                    if (Files.isDirectory(p)) libs.add(p);
+                }
+            }
+        } catch (Exception ignored) {}
+        return libs;
+    }
+
+    /**
+     * Use the Windows registry to find where Steam itself is installed.
+     * Mirrors the logic in Decompile.java's findSteamPath().
+     * Returns null on non-Windows or if the registry query fails.
+     */
+    static Path findSteamRootWindows() {
+        try {
+            // 64-bit Windows stores the Steam key under Wow6432Node; 32-bit does not.
+            String regKey = System.getProperty("os.arch", "").contains("64")
+                ? "HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\Valve\\Steam"
+                : "HKEY_LOCAL_MACHINE\\SOFTWARE\\Valve\\Steam";
+
+            Process proc = Runtime.getRuntime().exec(
+                new String[]{"reg", "query", regKey, "/v", "InstallPath"});
+            proc.waitFor();
+            String out = new String(proc.getInputStream().readAllBytes()).trim();
+
+            // Output looks like:   InstallPath    REG_SZ    C:\Program Files (x86)\Steam
+            // The actual path is everything after the last run of 4+ spaces.
+            int idx = out.lastIndexOf("    ");
+            if (idx < 0) return null;
+            Path p = Path.of(out.substring(idx).trim());
+            return Files.isDirectory(p) ? p : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Collect all Steam library roots on this machine.
+     * On Windows: uses the registry to find the Steam install, then reads
+     * libraryfolders.vdf to discover every additional library.
+     * On Linux/macOS: checks the well-known default Steam data directories.
+     */
+    static List<Path> findAllSteamLibraries() {
+        List<Path> steamRoots = new ArrayList<>();
+        String os  = System.getProperty("os.name", "").toLowerCase();
+        String home = System.getProperty("user.home", "");
+
+        if (os.contains("win")) {
+            Path steamRoot = findSteamRootWindows();
+            if (steamRoot != null) steamRoots.add(steamRoot);
+            // Also check common fallback locations in case registry query failed.
+            for (String fb : new String[]{
+                    System.getenv("ProgramFiles(x86)") != null
+                        ? System.getenv("ProgramFiles(x86)") + "\\Steam" : null,
+                    "C:\\Program Files (x86)\\Steam",
+                    "C:\\Program Files\\Steam"}) {
+                if (fb != null) { Path p = Path.of(fb); if (Files.isDirectory(p)) steamRoots.add(p); }
+            }
+        } else if (os.contains("mac")) {
+            for (String r : new String[]{
+                    home + "/Library/Application Support/Steam"})
+                { Path p = Path.of(r); if (Files.isDirectory(p)) steamRoots.add(p); }
+        } else {
+            // Linux / Steam Deck
+            for (String r : new String[]{
+                    home + "/.steam/steam",
+                    home + "/.local/share/Steam",
+                    home + "/snap/steam/common/.local/share/Steam"})
+                { Path p = Path.of(r); if (Files.isDirectory(p)) steamRoots.add(p); }
+        }
+
+        // Expand each Steam root via its libraryfolders.vdf to find extra libraries.
+        List<Path> allLibs = new ArrayList<>(steamRoots);
+        for (Path root : steamRoots) {
+            Path vdf = root.resolve("steamapps/libraryfolders.vdf");
+            if (Files.isRegularFile(vdf))
+                for (Path lib : parseSteamLibraries(vdf))
+                    if (!allLibs.contains(lib)) allLibs.add(lib);
+        }
+        return allLibs;
+    }
+
+    /**
+     * Search every detected Steam library for a ProjectZomboid/media folder.
+     * Returns the path as a String, or null if not found.
+     * On macOS the media folder is inside the .app bundle.
+     */
+    static String detectSteamMediaPath() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+
+        for (Path lib : findAllSteamLibraries()) {
+            // Standard location across Windows and Linux.
+            Path pz = lib.resolve("steamapps/common/ProjectZomboid");
+            Path media = pz.resolve("media");
+            if (Files.isDirectory(media)) return media.toString();
+
+            // macOS wraps the game in an .app bundle.
+            if (os.contains("mac")) {
+                Path macMedia = pz.resolve(
+                    "ProjectZomboid.app/Contents/Resources/media");
+                if (Files.isDirectory(macMedia)) return macMedia.toString();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Write a WorldEd project file (.pzw) that links all processed cells.
+     *
+     * @param pzwPath       destination path for the .pzw file
+     * @param pzwName       base name (no extension) used in ZombieSpawnMap filename
+     * @param cells         list of [cellX, cellY] pairs that were successfully processed
+     * @param minCX,minCY   smallest cell X and Y across all discovered lotheaders
+     * @param maxCX,maxCY   largest  cell X and Y
+     * @param outDir        output directory (maps/ subfolder created here)
+     */
+    static void writePzw(Path pzwPath, String pzwName,
+                         List<int[]> cells,
+                         int minCX, int minCY, int maxCX, int maxCY,
+                         Path outDir) throws IOException {
+
+        // World grid dimensions (number of cells wide / tall).
+        int worldW = maxCX - minCX + 1;
+        int worldH = maxCY - minCY + 1;
+
+        // Create the empty maps/ subfolder that GenerateLots writes into.
+        Path mapsDir = outDir.resolve("maps");
+        Files.createDirectories(mapsDir);
+
+        // Detect Steam media path.
+        String tileDefPath = detectSteamMediaPath();
+        if (tileDefPath == null) {
+            tileDefPath = "ProjectZomboid/media";
+            System.err.println("WARNING: Steam ProjectZomboid installation not found.");
+            System.err.println("         TileDefFolder set to dummy path \"" + tileDefPath + "\".");
+            System.err.println("         Open " + pzwPath.getFileName()
+                + " in WorldEd and correct it under GenerateLots > TileDefFolder.");
+        }
+
+        // Build <cell> entries — normalise world coords so top-left = (0,0).
+        StringBuilder cellLines = new StringBuilder();
+        // Sort cells x-major then y for a tidy file.
+        cells.sort((a, b) -> a[0] != b[0] ? Integer.compare(a[0], b[0]) : Integer.compare(a[1], b[1]));
+        for (int[] cc : cells) {
+            int nx = cc[0] - minCX;   // normalised grid x (0-based)
+            int ny = cc[1] - minCY;   // normalised grid y (0-based)
+            String tmxName = "MyMap_" + cc[0] + "_" + cc[1] + ".tmx";
+            cellLines.append(" <cell x=\"").append(nx)
+                     .append("\" y=\"").append(ny)
+                     .append("\" map=\"").append(tmxName).append("\"/>\n");
+        }
+
+        // Assemble the full PZW XML, modelled on the 1x2.pzw sample.
+        // The static boilerplate (propertyenum/def, templates, objecttype/group) is
+        // identical across all WorldEd projects and copied verbatim from the sample.
+        String pzw =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          + "<world version=\"1.0\" width=\"" + worldW + "\" height=\"" + worldH + "\">\n"
+          + " <BMPToTMX>\n"
+          + "  <tmxexportdir path=\".\"/>\n"
+          + "  <rulesfile path=\"\"/>\n"
+          + "  <blendsfile path=\"\"/>\n"
+          + "  <mapbasefile path=\"\"/>\n"
+          + "  <assign-maps-to-world checked=\"true\"/>\n"
+          + "  <warn-unknown-colors checked=\"true\"/>\n"
+          + "  <compress checked=\"true\"/>\n"
+          + "  <copy-pixels checked=\"true\"/>\n"
+          + "  <update-existing checked=\"false\"/>\n"
+          + " </BMPToTMX>\n"
+          + " <TMXToBMP>\n"
+          + "  <mainImage generate=\"true\"/>\n"
+          + "  <vegetationImage generate=\"true\"/>\n"
+          + "  <buildingsImage path=\"\" generate=\"false\"/>\n"
+          + " </TMXToBMP>\n"
+          + " <GenerateLots>\n"
+          + "  <exportdir path=\"maps\"/>\n"
+          + "  <ZombieSpawnMap path=\"" + pzwName + "_ZombieSpawnMap.png\"/>\n"
+          + "  <TileDefFolder path=\"" + tileDefPath.replace("\\", "/") + "\"/>\n"
+          + "  <worldOrigin origin=\"" + minCX + "," + minCY + "\"/>\n"
+          + " </GenerateLots>\n"
+          + " <LuaSettings>\n"
+          + "  <spawnPointsFile path=\"\"/>\n"
+          + "  <worldObjectsFile path=\"\"/>\n"
+          + " </LuaSettings>\n"
+          + " <propertyenum name=\"Direction\" choices=\"N,S,W,E\" multi=\"false\"/>\n"
+          + " <propertyenum name=\"Pose\" choices=\"pose01,pose02,pose03\" multi=\"false\"/>\n"
+          + " <propertyenum name=\"Skin\" choices=\"White,Black\" multi=\"false\"/>\n"
+          + " <propertyenum name=\"RoomTone\" choices=\"Generic,Barn,Mall,Warehouse,Prison,Church,Office,Factory\" multi=\"false\"/>\n"
+          + " <propertydef name=\"Direction\" default=\"N\" enum=\"Direction\"/>\n"
+          + " <propertydef name=\"FaceDirection\" default=\"true\"/>\n"
+          + " <propertydef name=\"WaterDirection\" default=\"0.0\"/>\n"
+          + " <propertydef name=\"WaterSpeed\" default=\"0.0\"/>\n"
+          + " <propertydef name=\"WaterGround\" default=\"false\"/>\n"
+          + " <propertydef name=\"WaterShore\" default=\"true\"/>\n"
+          + " <propertydef name=\"Female\" default=\"true\"/>\n"
+          + " <propertydef name=\"Outfit\" default=\"\"/>\n"
+          + " <propertydef name=\"Pose\" default=\"pose01\" enum=\"Pose\"/>\n"
+          + " <propertydef name=\"Script\" default=\"\"/>\n"
+          + " <propertydef name=\"Skin\" default=\"White\" enum=\"Skin\"/>\n"
+          + " <propertydef name=\"RoomTone\" default=\"Generic\" enum=\"RoomTone\"/>\n"
+          + " <propertydef name=\"EntireBuilding\" default=\"false\"/>\n"
+          + " <template name=\"ParkingStallN\">\n"
+          + "  <property name=\"Direction\" value=\"N\"/>\n"
+          + " </template>\n"
+          + " <template name=\"ParkingStallS\">\n"
+          + "  <property name=\"Direction\" value=\"S\"/>\n"
+          + " </template>\n"
+          + " <template name=\"ParkingStallW\">\n"
+          + "  <property name=\"Direction\" value=\"W\"/>\n"
+          + " </template>\n"
+          + " <template name=\"ParkingStallE\">\n"
+          + "  <property name=\"Direction\" value=\"E\"/>\n"
+          + " </template>\n"
+          + " <template name=\"WaterFlowN\">\n"
+          + "  <property name=\"WaterDirection\" value=\"0\"/>\n"
+          + "  <property name=\"WaterSpeed\" value=\"1.0\"/>\n"
+          + " </template>\n"
+          + " <template name=\"WaterFlowS\">\n"
+          + "  <property name=\"WaterDirection\" value=\"180\"/>\n"
+          + "  <property name=\"WaterSpeed\" value=\"1.0\"/>\n"
+          + " </template>\n"
+          + " <template name=\"WaterFlowE\">\n"
+          + "  <property name=\"WaterDirection\" value=\"90\"/>\n"
+          + "  <property name=\"WaterSpeed\" value=\"1.0\"/>\n"
+          + " </template>\n"
+          + " <template name=\"WaterFlowW\">\n"
+          + "  <property name=\"WaterDirection\" value=\"270\"/>\n"
+          + "  <property name=\"WaterSpeed\" value=\"1.0\"/>\n"
+          + " </template>\n"
+          + " <template name=\"WaterZone\">\n"
+          + "  <property name=\"WaterGround\" value=\"false\"/>\n"
+          + "  <property name=\"WaterShore\" value=\"true\"/>\n"
+          + " </template>\n"
+          + " <template name=\"RoomTone\">\n"
+          + "  <property name=\"RoomTone\" value=\"Generic\"/>\n"
+          + "  <property name=\"EntireBuilding\" value=\"false\"/>\n"
+          + " </template>\n"
+          + " <objecttype name=\"TownZone\"/>\n"
+          + " <objecttype name=\"Forest\"/>\n"
+          + " <objecttype name=\"DeepForest\"/>\n"
+          + " <objecttype name=\"Nav\"/>\n"
+          + " <objecttype name=\"Vegitation\"/>\n"
+          + " <objecttype name=\"TrailerPark\"/>\n"
+          + " <objecttype name=\"Farm\"/>\n"
+          + " <objecttype name=\"ParkingStall\"/>\n"
+          + " <objecttype name=\"FarmLand\"/>\n"
+          + " <objecttype name=\"WaterFlow\"/>\n"
+          + " <objecttype name=\"WaterZone\"/>\n"
+          + " <objecttype name=\"Mannequin\"/>\n"
+          + " <objecttype name=\"RoomTone\"/>\n"
+          + " <objectgroup name=\"ParkingStall\" color=\"#ff007f\" defaulttype=\"ParkingStall\"/>\n"
+          + " <objectgroup name=\"TownZone\" color=\"#aa0000\" defaulttype=\"TownZone\"/>\n"
+          + " <objectgroup name=\"Forest\" color=\"#00aa00\" defaulttype=\"Forest\"/>\n"
+          + " <objectgroup name=\"Nav\" color=\"#55aaff\" defaulttype=\"Nav\"/>\n"
+          + " <objectgroup name=\"DeepForest\" color=\"#003500\" defaulttype=\"DeepForest\"/>\n"
+          + " <objectgroup name=\"Vegitation\" color=\"#b3b300\" defaulttype=\"Vegitation\"/>\n"
+          + " <objectgroup name=\"TrailerPark\" color=\"#f50000\" defaulttype=\"TrailerPark\"/>\n"
+          + " <objectgroup name=\"Farm\" color=\"#55ff7f\" defaulttype=\"Farm\"/>\n"
+          + " <objectgroup name=\"FarmLand\" color=\"#bcff7d\" defaulttype=\"FarmLand\"/>\n"
+          + " <objectgroup name=\"WaterFlow\" color=\"#0000ff\" defaulttype=\"WaterFlow\"/>\n"
+          + " <objectgroup name=\"WaterZone\" color=\"#0000ff\" defaulttype=\"WaterZone\"/>\n"
+          + " <objectgroup name=\"Mannequin\" color=\"#0000ff\" defaulttype=\"Mannequin\"/>\n"
+          + " <objectgroup name=\"RoomTone\" color=\"#0000ff\" defaulttype=\"RoomTone\"/>\n"
+          + cellLines
+          + "</world>\n";
+
+        Files.writeString(pzwPath, pzw, java.nio.charset.StandardCharsets.UTF_8);
+        log("  Written " + pzwPath);
+    }
 
     // ── TMX writer ────────────────────────────────────────────────────────────
 
