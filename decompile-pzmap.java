@@ -128,6 +128,7 @@ public class run {
         int numLevels;
         List<LotRoom>     rooms     = new ArrayList<>();
         List<LotBuilding> buildings = new ArrayList<>();
+        byte[] spawnBytes = new byte[0]; // 30×30 = 900 bytes, x-outer y-inner
         // chunks per axis = 300 / chunkW  (= 30 for standard cells)
         int chunksX() { return CELL_TILES / chunkW; }
         int chunksY() { return CELL_TILES / chunkH; }
@@ -277,6 +278,8 @@ public class run {
 
             // Process each cell: TMX + TBX files.
             List<int[]> processedCells = new ArrayList<>();
+            // cellX_cellY → 900 spawn bytes for PNG reconstruction
+            Map<String, byte[]> spawnDataMap = new LinkedHashMap<>();
             int processed = 0, failed = 0;
             for (Path lh : lotheaders) {
                 int[] cc = parseCellCoords(lh.getFileName().toString());
@@ -291,8 +294,10 @@ public class run {
                 Path outTmx = outDir.resolve("MyMap_" + cellTag + ".tmx");
                 try {
                     log("\n== Cell " + cellTag + " ==================================");
-                    processCell(lh, lp, outTmx, tilesDir, tilesetsRef);
+                    LotHeader hdr = processCell(lh, lp, outTmx, tilesDir, tilesetsRef);
                     processedCells.add(cc);
+                    if (hdr.spawnBytes.length == 900)
+                        spawnDataMap.put(cellTag, hdr.spawnBytes);
                     processed++;
                 } catch (Exception e) {
                     System.err.println("ERROR processing cell " + cellTag + ": " + e.getMessage());
@@ -303,6 +308,10 @@ public class run {
             // Write the WorldEd project file (.pzw).
             Path pzwPath = outDir.resolve(pzwName + ".pzw");
             writePzw(pzwPath, pzwName, processedCells, minCX, minCY, maxCX, maxCY, outDir, luaZones);
+
+            // Reconstruct merged ZombieSpawnMap PNG from lotheader spawn bytes.
+            Path spawnPng = outDir.resolve(pzwName + "_ZombieSpawnMap.png");
+            writeZombieSpawnMap(spawnPng, spawnDataMap, minCX, minCY, maxCX, maxCY);
 
             log("\nDone. " + processed + " cell(s) written"
                 + (failed > 0 ? ", " + failed + " skipped/failed" : "")
@@ -342,7 +351,7 @@ public class run {
 
     // ── processCell: convert one (lotheader, lotpack) pair → TMX + TBX files ─
 
-    static void processCell(Path lotheaderPath, Path lotpackPath, Path outPath,
+    static LotHeader processCell(Path lotheaderPath, Path lotpackPath, Path outPath,
                             Path tilesDir, Path tilesetsRef) throws Exception {
 
         // Parse cell coordinates from the lotheader filename: "X_Y.lotheader"
@@ -433,6 +442,7 @@ public class run {
         // 5 — write TMX (building tiles already erased from 'tiles' by extractBuildings)
         log("[5/5] Writing " + outPath + " ...");
         writeTmx(outPath, header, tiles, tilesetRegistry, lotEntries);
+        return header;
     }
 
     // ── Tiles folder scanner ──────────────────────────────────────────────────
@@ -556,7 +566,9 @@ public class run {
                 for (int j = 0; j < n; j++) bld.roomIDs.add(readInt32LE(in));
                 h.buildings.add(bld);
             }
-            // Zombie spawn grid -- discard (remainder of file)
+            // Zombie spawn grid: 30×30 = 900 bytes, x-outer y-inner
+            // Each byte = red channel of the ZombieSpawnMap PNG at (cellX*30+x, cellY*30+y)
+            h.spawnBytes = in.readNBytes(900);
         }
         return h;
     }
@@ -1421,6 +1433,67 @@ public class run {
      * imported zones that are not already in the known set are appended
      * with no color attribute (WorldEd accepts this fine).
      */
+    /**
+     * Reconstruct the ZombieSpawnMap PNG from the 900-byte spawn grids embedded in
+     * each cell's lotheader.
+     *
+     * Format (from generateHeaderAux in lotfilesmanager.cpp):
+     *   for x in [0,30): for y in [0,30):
+     *     byte = qRed(ZombieSpawnMap.pixel(cellX*30+x, cellY*30+y))
+     *
+     * So each byte is the RED channel of one pixel.  The original PNG is grayscale
+     * (R=G=B=value).  Black (0) = no zombie spawn; white (255) = full spawn density.
+     *
+     * PNG dimensions: (maxCX-minCX+1)*30 × (maxCY-minCY+1)*30 pixels.
+     * Each pixel covers one 10×10-tile chunk.
+     * Cells not present in spawnDataMap are left black (all zeros).
+     *
+     * @param out         destination PNG path
+     * @param spawnDataMap  "cellX_cellY" → 900 bytes, x-outer y-inner
+     * @param minCX/minCY/maxCX/maxCY  world cell extent
+     */
+    static void writeZombieSpawnMap(Path out,
+                                    Map<String, byte[]> spawnDataMap,
+                                    int minCX, int minCY,
+                                    int maxCX, int maxCY) throws IOException {
+        int cellsW = maxCX - minCX + 1;
+        int cellsH = maxCY - minCY + 1;
+        int imgW   = cellsW * 30;
+        int imgH   = cellsH * 30;
+
+        // RGB image: grayscale gradient — R=G=B=value (0=black, 255=white).
+        BufferedImage img = new BufferedImage(imgW, imgH, BufferedImage.TYPE_INT_RGB);
+        // BufferedImage is zero-initialised → all pixels start black (0x000000). Good.
+
+        for (Map.Entry<String, byte[]> e : spawnDataMap.entrySet()) {
+            String key = e.getKey();
+            byte[] spawn = e.getValue();
+            if (spawn.length < 900) continue;
+
+            int[] cc = parseCellCoords(key + ".lotheader"); // reuse parser
+            int cx = cc[0];
+            int cy = cc[1];
+
+            // Pixel origin for this cell in the merged image
+            int baseX = (cx - minCX) * 30;
+            int baseY = (cy - minCY) * 30;
+
+            // Data is stored x-outer y-inner: spawn[x*30 + y]
+            for (int x = 0; x < 30; x++) {
+                for (int y = 0; y < 30; y++) {
+                    int v = spawn[x * 30 + y] & 0xFF; // unsigned
+                    int rgb = (v << 16) | (v << 8) | v; // R=G=B=v (grayscale gradient)
+                    img.setRGB(baseX + x, baseY + y, rgb);
+                }
+            }
+        }
+
+        Files.createDirectories(out.getParent() != null ? out.getParent() : Path.of("."));
+        ImageIO.write(img, "png", out.toFile());
+        log("  Written " + out + "  (" + imgW + "×" + imgH + " px, "
+            + spawnDataMap.size() + " cell(s) merged)");
+    }
+
     static String buildObjectTypesAndGroups(List<LuaZone> luaZones) {
         // Ordered known types: name → color (null = no color attribute)
         // Order matches the zone_example.pzw reference.
