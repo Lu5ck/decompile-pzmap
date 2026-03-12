@@ -92,6 +92,14 @@ public class run {
     };
     static final int NUM_SUBLAYERS = SUBLAYERS.length; // 6
 
+    // Lotpack squares can occasionally carry more than NUM_SUBLAYERS tile entries
+    // (the PZ engine writes however many entries exist; there is no hardcoded cap).
+    // These "overflow" entries (index >= NUM_SUBLAYERS) have no corresponding TBX
+    // sublayer and must stay in the TMX.  We reserve 8 extra slots to be safe;
+    // they are written to the TMX as additional layers named "0_Extra0", "0_Extra1", …
+    static final int OVERFLOW_SUBLAYERS = 8;
+    static final int NUM_ALL_SUBLAYERS  = NUM_SUBLAYERS + OVERFLOW_SUBLAYERS; // 14
+
     // ── data classes ─────────────────────────────────────────────────────────
 
     // Pixel multiplier for levelisometric: BOTH x and y use tileHeight (32)
@@ -342,7 +350,9 @@ public class run {
         int cellW = header.chunksX() * header.chunkW;  // = 300
         int cellH = header.chunksY() * header.chunkH;
         // tiles[level][sublayer][y][x] = lotheader tileID  (-1 = empty)
-        int[][][][] tiles = new int[header.numLevels][NUM_SUBLAYERS][cellH][cellW];
+        // Slots 0..NUM_SUBLAYERS-1  = 6 named sublayers copied to .tbx for buildings.
+        // Slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1 = overflow entries that always stay in TMX.
+        int[][][][] tiles = new int[header.numLevels][NUM_ALL_SUBLAYERS][cellH][cellW];
         for (int[][][] lv : tiles)
             for (int[][] sl : lv)
                 for (int[] row : sl)
@@ -592,9 +602,12 @@ public class run {
                         for (int e = 0; e < n; e++) {
                             int tid = readInt32LE(raf);
                             if (tid < 0) continue;    // -1 = empty sublayer, skip
-                            int sl  = Math.min(e, NUM_SUBLAYERS - 1);
-                            if (wx < cellW && wy < cellH && tiles[z][sl][wy][wx] < 0)
-                                tiles[z][sl][wy][wx] = tid;
+                            // Store all entries up to NUM_ALL_SUBLAYERS.
+                            // Entries [0..NUM_SUBLAYERS-1] are the 6 named sublayers (tbx-eligible).
+                            // Entries [NUM_SUBLAYERS..] are overflow; they stay in TMX always.
+                            if (e >= NUM_ALL_SUBLAYERS) continue;  // extremely unlikely; ignore beyond cap
+                            if (wx < cellW && wy < cellH && tiles[z][e][wy][wx] < 0)
+                                tiles[z][e][wy][wx] = tid;
                         }
                     }
                 }
@@ -788,12 +801,17 @@ public class run {
                                 if (owner >= 0 && owner != bi) continue;
                             }
                         }
+                        // Copy the 6 named sublayers into the building's tile store
+                        // and erase them from the TMX grid (they go to the .tbx file).
                         for (int sl = 0; sl < NUM_SUBLAYERS; sl++) {
                             if (gy < tiles[z][sl].length && gx < tiles[z][sl][gy].length) {
                                 bd.buildingTiles[z][sl][by][bx] = tiles[z][sl][gy][gx];
                                 tiles[z][sl][gy][gx] = -1;  // erase from TMX grid
                             }
                         }
+                        // Overflow sublayers (slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1) are
+                        // NOT copied to tbx and NOT erased — they stay in the TMX grid so
+                        // no tile data is lost for squares that have >6 lotpack entries.
                     }
                 }
             }
@@ -867,8 +885,8 @@ public class run {
         Set<String> usedSet = new LinkedHashSet<>();
         for (int z = 0; z < numLevels; z++)
             for (int sl = 0; sl < NUM_SUBLAYERS; sl++)
-                for (int by = 0; by < bh; by++)
-                    for (int bx = 0; bx < bw; bx++) {
+                for (int by = 0; by <= bh; by++)
+                    for (int bx = 0; bx <= bw; bx++) {
                         int tid = bd.buildingTiles[z][sl][by][bx];
                         if (tid >= 0 && tid < header.tileNames.size())
                             usedSet.add(header.tileNames.get(tid));
@@ -1430,23 +1448,27 @@ public class run {
             }
         }
 
-        // <layer> — emit all 6 sublayers for non-empty levels only.
+        // <layer> — emit all sublayers for non-empty levels only.
         // Level 0 (ground floor) is always emitted.  Upper levels (1+) are skipped
         // entirely when every one of their sublayers is all-zero — they are unused
         // floors that would just bloat the file.
+        // Overflow sublayers (slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1) represent
+        // lotpack entries beyond the 6 named slots; they are written as extra TMX
+        // layers named "{lv}_Extra0", "{lv}_Extra1", … only when non-empty.
         int layerId = 1;
         for (int lv = 0; lv < header.numLevels; lv++) {
-            // Check whether this level has any tile data at all
+            // Check whether this level has any tile data at all (named + overflow slots)
             if (lv > 0) {
                 boolean anyData = false;
-                for (int sl = 0; sl < NUM_SUBLAYERS; sl++) {
+                for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++) {
                     if (!isEmpty(tiles[lv][sl])) { anyData = true; break; }
                 }
                 if (!anyData) {
-                    layerId += NUM_SUBLAYERS;  // keep layerId counter consistent
+                    layerId += NUM_SUBLAYERS;  // keep layerId counter consistent (named slots only)
                     continue;
                 }
             }
+            // Emit the 6 named sublayers.
             for (int sl = 0; sl < NUM_SUBLAYERS; sl++) {
                 String layerName = lv + "_" + SUBLAYERS[sl];
                 sb.append(" <layer id=\"").append(layerId++).append("\"");
@@ -1454,6 +1476,19 @@ public class run {
                 sb.append(" width=\"300\" height=\"300\">\n");
                 sb.append("  <data encoding=\"base64\" compression=\"zlib\">\n");
                 sb.append("   ").append(encodeLayerData(tiles[lv][sl], header, gidMap));
+                sb.append("\n  </data>\n");
+                sb.append(" </layer>\n");
+            }
+            // Emit overflow sublayers (lotpack entries beyond the 6 standard slots).
+            // These are written as extra layers so no tile data is silently dropped.
+            for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
+                if (isEmpty(tiles[lv][ovsl])) continue;  // omit if entirely empty
+                String layerName = lv + "_Extra" + (ovsl - NUM_SUBLAYERS);
+                sb.append(" <layer id=\"").append(layerId++).append("\"");
+                sb.append(" name=\"").append(layerName).append("\"");
+                sb.append(" width=\"300\" height=\"300\">\n");
+                sb.append("  <data encoding=\"base64\" compression=\"zlib\">\n");
+                sb.append("   ").append(encodeLayerData(tiles[lv][ovsl], header, gidMap));
                 sb.append("\n  </data>\n");
                 sb.append(" </layer>\n");
             }
