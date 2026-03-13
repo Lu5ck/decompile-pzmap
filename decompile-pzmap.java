@@ -371,11 +371,19 @@ public class run {
         // 2 — build tileset registry
         log("[2/5] Building tileset registry ...");
         Map<String, TilesetInfo> tilesetRegistry = new LinkedHashMap<>();
+        // Secondary registry from tilesDir: used as fallback to resolve subfolder
+        // paths (e.g. "2x/") for tilesets absent from the reference TMX.
+        Map<String, TilesetInfo> tilesDirRegistry = new LinkedHashMap<>();
         if (tilesetsRef != null) {
             tilesetRegistry = readTilesetsFromTmx(tilesetsRef);
             log("      " + tilesetRegistry.size() + " tilesets read from " + tilesetsRef);
             if (tilesetRegistry.isEmpty())
                 log("      WARNING: No tilesets found in reference TMX.");
+            if (tilesDir != null) {
+                tilesDirRegistry = scanTilesDir(tilesDir);
+                log("      " + tilesDirRegistry.size() + " tileset PNGs found in " + tilesDir
+                    + " (subfolder fallback for tilesets absent from reference TMX)");
+            }
         } else if (tilesDir != null) {
             tilesetRegistry = scanTilesDir(tilesDir);
             log("      " + tilesetRegistry.size() + " tileset PNGs found in " + tilesDir);
@@ -441,7 +449,7 @@ public class run {
 
         // 5 — write TMX (building tiles already erased from 'tiles' by extractBuildings)
         log("[5/5] Writing " + outPath + " ...");
-        writeTmx(outPath, header, tiles, tilesetRegistry, lotEntries);
+        writeTmx(outPath, header, tiles, tilesetRegistry, tilesDirRegistry, lotEntries);
         return header;
     }
 
@@ -463,7 +471,12 @@ public class run {
         try (Stream<Path> s = Files.walk(dir)) {
             pngs = s.filter(Files::isRegularFile)
                     .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".png"))
-                    .sorted(Comparator.comparing(p -> p.getFileName().toString()))  // case-sensitive: uppercase before lowercase, matching WorldEd order
+                    // Sort by filename only (case-sensitive, matching WorldEd GID order).
+                    // Ties (same filename in root vs subfolder) are broken by depth descending
+                    // so that the subfolder copy always wins — subfolders like "2x/" hold the
+                    // current authoritative version when both a root and a subfolder copy exist.
+                    .sorted(Comparator.comparing((Path p) -> p.getFileName().toString())
+                        .thenComparingInt(p -> -(dir.relativize(p).getNameCount())))
                     .toList();
         }
 
@@ -475,13 +488,13 @@ public class run {
             String relPath  = dir.relativize(png).toString().replace('\\', '/');
 
             if (result.containsKey(name)) {
-                log("      WARNING: duplicate tileset name '" + name + "' at " + relPath + ", skipping");
+                log("      WARNING: duplicate tileset name '" + name + "' (keeping subfolder copy, skipping " + relPath + ")");
                 continue;
             }
 
             int[] dims = readPngDimensions(png);
             if (dims == null) {
-                log("      WARNING: could not read PNG dimensions for " + relPath + ", skipping");
+                log("      WARNING: could not read image dimensions for " + relPath + ", skipping");
                 continue;
             }
             int w = dims[0], h = dims[1];
@@ -495,30 +508,74 @@ public class run {
     }
 
     /**
-     * Reads width and height from a PNG file by parsing only the IHDR chunk.
-     * PNG structure: 8-byte signature + IHDR chunk (4-len, 4-type, 13-data, 4-crc).
-     * IHDR data: width(4), height(4), bitDepth(1), colorType(1), ...
-     * Returns [width, height] or null on error.
+     * Reads width and height from an image file.
+     * Supports true PNG (magic: 89 50 4E 47) and JPEG-encoded files with any
+     * extension (magic: FF D8), which occur in PZ mod tile packs where JPEG data
+     * is saved with a .png extension.
+     *
+     * PNG: parses the IHDR chunk (bytes 16-23).
+     * JPEG: scans for SOF0/SOF1/SOF2 markers (FF C0 / FF C1 / FF C2) which
+     *       carry the frame height and width.
+     *
+     * Returns [width, height] or null on any parse error.
      */
     static int[] readPngDimensions(Path png) {
         try (InputStream in = new BufferedInputStream(Files.newInputStream(png))) {
-            // Skip 8-byte PNG signature
-            if (in.skip(8) != 8) return null;
-            // Read chunk length (4 bytes, big-endian) — should be 13 for IHDR
-            byte[] buf = new byte[4];
-            if (in.read(buf) != 4) return null;
-            // Read chunk type (4 bytes) — should be "IHDR"
-            if (in.read(buf) != 4) return null;
-            if (buf[0] != 'I' || buf[1] != 'H' || buf[2] != 'D' || buf[3] != 'R') return null;
-            // Read width (4 bytes big-endian)
-            if (in.read(buf) != 4) return null;
-            int w = ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16)
-                  | ((buf[2] & 0xFF) << 8)  |  (buf[3] & 0xFF);
-            // Read height (4 bytes big-endian)
-            if (in.read(buf) != 4) return null;
-            int h = ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16)
-                  | ((buf[2] & 0xFF) << 8)  |  (buf[3] & 0xFF);
-            return new int[]{ w, h };
+            byte[] magic = new byte[2];
+            if (in.read(magic) != 2) return null;
+
+            // ── PNG: 89 50 ────────────────────────────────────────────────
+            if ((magic[0] & 0xFF) == 0x89 && (magic[1] & 0xFF) == 0x50) {
+                // Skip remaining 6 signature bytes + 4 chunk-length bytes = 10 more
+                if (in.skip(10) != 10) return null;
+                byte[] buf = new byte[4];
+                // Chunk type — must be "IHDR"
+                if (in.read(buf) != 4) return null;
+                if (buf[0] != 'I' || buf[1] != 'H' || buf[2] != 'D' || buf[3] != 'R') return null;
+                // Width (4 bytes big-endian)
+                if (in.read(buf) != 4) return null;
+                int w = ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16)
+                      | ((buf[2] & 0xFF) << 8)  |  (buf[3] & 0xFF);
+                // Height (4 bytes big-endian)
+                if (in.read(buf) != 4) return null;
+                int h = ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16)
+                      | ((buf[2] & 0xFF) << 8)  |  (buf[3] & 0xFF);
+                return new int[]{ w, h };
+            }
+
+            // ── JPEG: FF D8 ───────────────────────────────────────────────
+            if ((magic[0] & 0xFF) == 0xFF && (magic[1] & 0xFF) == 0xD8) {
+                // Scan markers until we find SOF0 (FF C0), SOF1 (FF C1), or SOF2 (FF C2).
+                // Each marker: FF xx, then 2-byte big-endian payload length (includes the 2 length bytes).
+                byte[] buf2 = new byte[2];
+                while (true) {
+                    // Find next FF marker byte
+                    int b = in.read();
+                    if (b < 0) return null;
+                    if ((b & 0xFF) != 0xFF) continue;
+                    // Read marker type
+                    int marker = in.read();
+                    if (marker < 0) return null;
+                    // SOF markers that carry frame dimensions
+                    if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+                        // Payload: 2-byte length, 1-byte precision, 2-byte height, 2-byte width
+                        if (in.skip(2) < 0) return null; // skip length
+                        if (in.skip(1) < 0) return null; // skip precision (bits/sample)
+                        if (in.read(buf2) != 2) return null;
+                        int h = ((buf2[0] & 0xFF) << 8) | (buf2[1] & 0xFF);
+                        if (in.read(buf2) != 2) return null;
+                        int w = ((buf2[0] & 0xFF) << 8) | (buf2[1] & 0xFF);
+                        return new int[]{ w, h };
+                    }
+                    // Skip this segment: read 2-byte length, then skip (length - 2) bytes
+                    if (in.read(buf2) != 2) return null;
+                    int segLen = ((buf2[0] & 0xFF) << 8) | (buf2[1] & 0xFF);
+                    int skip = segLen - 2;
+                    if (skip > 0) in.skip(skip);
+                }
+            }
+
+            return null; // unknown format
         } catch (IOException e) {
             return null;
         }
@@ -1699,6 +1756,7 @@ public class run {
 
     static void writeTmx(Path out, LotHeader header, int[][][][] tiles,
                          Map<String, TilesetInfo> tilesetRegistry,
+                         Map<String, TilesetInfo> tilesDirRegistry,
                          List<String> lotEntries) throws IOException {
 
         int cellW = header.chunksX() * header.chunkW;
@@ -1743,8 +1801,15 @@ public class run {
                     log("      WARNING: tileset '" + name + "' not in reference TMX,"
                       + " assigning GID " + lastEnd + " (block size 1024)");
                     allFirstGids.put(name, lastEnd);
-                    // Add a placeholder entry so it gets emitted
-                    tilesetRegistry.put(name, new TilesetInfo(name, name + ".png", "../Tiles/" + name + ".png", 1024, 2048, lastEnd));
+                    // Resolve source path: prefer tilesDir scan (knows subfolder like "2x/")
+                    // over the hardcoded flat "../Tiles/{name}.png" fallback.
+                    TilesetInfo fallback = tilesDirRegistry.get(name);
+                    if (fallback != null) {
+                        tilesetRegistry.put(name, new TilesetInfo(name, fallback.filename(),
+                            fallback.sourcePath(), fallback.imgW(), fallback.imgH(), lastEnd));
+                    } else {
+                        tilesetRegistry.put(name, new TilesetInfo(name, name + ".png", "../Tiles/" + name + ".png", 1024, 2048, lastEnd));
+                    }
                 }
             }
         } else {
@@ -1771,12 +1836,26 @@ public class run {
                 int maxLocal = maxLocalIdx.get(name);
                 int rows = (maxLocal / TILESET_COLS) + 1;   // rows needed to include maxLocal
                 int blockSize = rows * TILESET_COLS;         // always a multiple of 16
-                int imgW = TILESET_COLS * TILE_IMG_W;        // = 16 * 64 = 1024
-                int imgH = rows * TILE_IMG_H;                // = rows * 128
-                tilesetRegistry.put(name, new TilesetInfo(name, name + ".png", imgW, imgH));
+
+                // If we have a real scanned TilesetInfo (from --tilesdir), use its actual
+                // dims and path. Only the block size (for GID spacing) comes from the
+                // lotheader max-index calculation — the scanned dims are authoritative.
+                // If no scan entry exists, synthesise a placeholder from the computed rows.
+                if (!tilesetRegistry.containsKey(name)) {
+                    int imgW = TILESET_COLS * TILE_IMG_W;    // = 16 * 64 = 1024
+                    int imgH = rows * TILE_IMG_H;            // = rows * 128
+                    tilesetRegistry.put(name, new TilesetInfo(name, name + ".png", imgW, imgH));
+                }
+                // Use actual tileCount from scanned info for blockSize when available,
+                // so GID spacing matches the real sheet dimensions.
+                TilesetInfo scannedInfo = tilesetRegistry.get(name);
+                if (scannedInfo != null && scannedInfo.tileCount() > blockSize) {
+                    blockSize = scannedInfo.tileCount();
+                }
                 nextGid += blockSize;
             }
-            // Fallback: tilesets from registry not yet in allFirstGids (tilesdir scan)
+            // Tilesets in registry (from --tilesdir scan) that aren't used in this cell:
+            // still assign them GIDs so the full registry is emitted in correct order.
             for (Map.Entry<String, TilesetInfo> e : tilesetRegistry.entrySet()) {
                 if (!allFirstGids.containsKey(e.getKey())) {
                     allFirstGids.put(e.getKey(), nextGid);
@@ -1818,11 +1897,30 @@ public class run {
             sb.append(" tileheight=\"").append(TILE_IMG_H).append("\">\n");
 
             if (info != null) {
-                sb.append("  <image source=\"").append(xmlEsc(info.sourcePath())).append("\"");
-                sb.append(" width=\"").append(info.imgW()).append("\"");
-                sb.append(" height=\"").append(info.imgH()).append("\"/>\n");
+                // If tilesDirRegistry has an entry for this tileset, use its actual
+                // scanned dims (correct) instead of whatever the reference TMX says.
+                // This fixes cases where the reference TMX was produced with wrong
+                // width/height values (e.g. wrong dims for JPEG-encoded .png tilesets).
+                // Source path still comes from the reference TMX so GIDs are preserved.
+                TilesetInfo scanned = tilesDirRegistry.get(name);
+                int emitW = (scanned != null) ? scanned.imgW() : info.imgW();
+                int emitH = (scanned != null) ? scanned.imgH() : info.imgH();
+                String emitSrc = (scanned != null) ? scanned.sourcePath() : info.sourcePath();
+                sb.append("  <image source=\"").append(xmlEsc(emitSrc)).append("\"");
+                sb.append(" width=\"").append(emitW).append("\"");
+                sb.append(" height=\"").append(emitH).append("\"/>\n");
             } else {
-                sb.append("  <image source=\"../Tiles/").append(xmlEsc(name)).append(".png\"/>\n");
+                // No info from primary registry — try tilesDir for correct subfolder path
+                TilesetInfo td = tilesDirRegistry.get(name);
+                String src = (td != null) ? td.sourcePath() : "../Tiles/" + name + ".png";
+                String emitSrcFb = src;
+                if (td != null) {
+                    sb.append("  <image source=\"").append(xmlEsc(emitSrcFb)).append("\"");
+                    sb.append(" width=\"").append(td.imgW()).append("\"");
+                    sb.append(" height=\"").append(td.imgH()).append("\"/>\n");
+                } else {
+                    sb.append("  <image source=\"").append(xmlEsc(emitSrcFb)).append("\"/>\n");
+                }
             }
             sb.append(" </tileset>\n");
         }
@@ -1834,7 +1932,9 @@ public class run {
                 sb.append(" name=\"").append(xmlEsc(name)).append("\"");
                 sb.append(" tilewidth=\"").append(TILE_IMG_W).append("\"");
                 sb.append(" tileheight=\"").append(TILE_IMG_H).append("\">\n");
-                sb.append("  <image source=\"../Tiles/").append(xmlEsc(name)).append(".png\"/>\n");
+                TilesetInfo td2 = tilesDirRegistry.get(name);
+                String src2 = (td2 != null) ? td2.sourcePath() : "../Tiles/" + name + ".png";
+                sb.append("  <image source=\"").append(xmlEsc(src2)).append("\"/>\n");
                 sb.append(" </tileset>\n");
             }
         }
