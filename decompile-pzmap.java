@@ -1133,11 +1133,14 @@ public class run {
                 }
             }
             // Pass 2: any tile with data that falls within a building's bounding box.
+            // Check ALL sublayer slots (named + overflow) so that squares whose only
+            // data lives in overflow slots (index >= NUM_SUBLAYERS) are still correctly
+            // attributed to the building that owns the tile position.
             for (int gy = 0; gy < cellH; gy++) {
                 for (int gx = 0; gx < cellW; gx++) {
                     if (tileBuilding[z][gy][gx] >= 0) continue;
                     boolean hasData = false;
-                    for (int sl = 0; sl < NUM_SUBLAYERS && !hasData; sl++)
+                    for (int sl = 0; sl < NUM_ALL_SUBLAYERS && !hasData; sl++)
                         if (gy < tiles[z][sl].length && gx < tiles[z][sl][gy].length
                                 && tiles[z][sl][gy][gx] >= 0) hasData = true;
                     if (!hasData) continue;
@@ -1221,18 +1224,18 @@ public class run {
                             }
                         }
                         // Overflow sublayers (slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1):
-                        // copy them into the building store and erase from the TMX grid,
-                        // matching the treatment of the 6 named sublayers above.
-                        // Previously these were left in the TMX, causing overflow tile data
-                        // that belongs to a building to bleed through as stray TMX layers.
-                        // Exception for --excludebuilding is handled by the erase-only path
-                        // that already ran above for that mode.
-                        if (!excludeBuilding) {
-                            for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
-                                if (gy < tiles[z][ovsl].length && gx < tiles[z][ovsl][gy].length) {
+                        // In normal mode: copy into the building store AND erase from TMX.
+                        // In --excludebuilding mode: erase from TMX only (no .tbx is written,
+                        // so there is nowhere to copy to — but they must still be removed from
+                        // the TMX grid so building overflow tiles don't bleed through as stray
+                        // Extra layers).  The comment in the previous version claiming this was
+                        // "handled by the erase-only path above" was incorrect; that path was
+                        // removed during an earlier refactor and never replaced.
+                        for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
+                            if (gy < tiles[z][ovsl].length && gx < tiles[z][ovsl][gy].length) {
+                                if (!excludeBuilding)
                                     bd.buildingTiles[z][ovsl][by][bx] = tiles[z][ovsl][gy][gx];
-                                    tiles[z][ovsl][gy][gx] = -1;  // erase from TMX grid
-                                }
+                                tiles[z][ovsl][gy][gx] = -1;  // always erase from TMX grid
                             }
                         }
                     }
