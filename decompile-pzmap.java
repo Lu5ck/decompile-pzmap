@@ -58,6 +58,10 @@
  *                                                     default "untitled" → untitled.pzw)
  *
  *       --objects   <objects.lua>                 (optional: zone/object file → imported into .pzw)
+ *       --excludebuilding                         (omit all building-specific tile layers and .tbx
+ *                                                  files; the lowest Floor sublayer of each building
+ *                                                  tile is kept in the TMX so ground surfaces are
+ *                                                  preserved after compaction)
  *   Without --tilesets or --tilesdir, tileset block sizes are computed from the tile
  *   names in the lotheader. The result is a self-consistent TMX that renders correctly
  *   in TileZed/WorldEd but may have different firstGid values from other cells.
@@ -202,6 +206,7 @@ public class run {
 
         Path tilesDir    = opts.containsKey("tilesdir") ? Path.of(opts.get("tilesdir")) : null;
         Path tilesetsRef = opts.containsKey("tilesets") ? Path.of(opts.get("tilesets")) : null;
+        boolean excludeBuilding = opts.containsKey("excludebuilding");
 
         // ── Map-folder mode: process every cell found in the directory ─────────
         if (opts.containsKey("mapdir")) {
@@ -294,7 +299,7 @@ public class run {
                 Path outTmx = outDir.resolve("MyMap_" + cellTag + ".tmx");
                 try {
                     log("\n== Cell " + cellTag + " ==================================");
-                    LotHeader hdr = processCell(lh, lp, outTmx, tilesDir, tilesetsRef);
+                    LotHeader hdr = processCell(lh, lp, outTmx, tilesDir, tilesetsRef, excludeBuilding);
                     processedCells.add(cc);
                     if (hdr.spawnBytes.length == 900)
                         spawnDataMap.put(cellTag, hdr.spawnBytes);
@@ -331,7 +336,8 @@ public class run {
             System.err.println("    --tilesets  <any existing MyMap_X_Y.tmx from this project> \\");
             System.err.println("    [--output   <output folder, default: same as --mapdir>] \\\\");
             System.err.println("    [--pzw      <project name, no extension, default: untitled>] \\\\");
-            System.err.println("    [--objects  <objects.lua path, optional>]");
+            System.err.println("    [--objects  <objects.lua path, optional>]") ;
+            System.err.println("    [--excludebuilding]                   (exclude building tiles from TMX; no .tbx output)");
             System.err.println();
             System.err.println("Usage (single-cell file mode):");
             System.err.println("  java run.java \\");
@@ -345,14 +351,15 @@ public class run {
             return;
         }
         String outName = opts.getOrDefault("output", deriveOutputName(lotheaderPath));
-        processCell(lotheaderPath, lotpackPath, Path.of(outName), tilesDir, tilesetsRef);
+        processCell(lotheaderPath, lotpackPath, Path.of(outName), tilesDir, tilesetsRef, excludeBuilding);
         log("\nDone! Open " + outName + " in WorldEd / TileZed.");
     }
 
     // ── processCell: convert one (lotheader, lotpack) pair → TMX + TBX files ─
 
     static LotHeader processCell(Path lotheaderPath, Path lotpackPath, Path outPath,
-                            Path tilesDir, Path tilesetsRef) throws Exception {
+                            Path tilesDir, Path tilesetsRef,
+                            boolean excludeBuilding) throws Exception {
 
         // Parse cell coordinates from the lotheader filename: "X_Y.lotheader"
         int[] cellCoords = parseCellCoords(lotheaderPath.getFileName().toString());
@@ -418,7 +425,7 @@ public class run {
         // NOTE: lotheader room rects are ALWAYS in cell-local tile space [0,300).
         // No world-origin subtraction needed.
         log("[4/5] Extracting buildings ...");
-        List<BuildingData> buildings = extractBuildings(header, tiles, roomIds);
+        List<BuildingData> buildings = extractBuildings(header, tiles, roomIds, excludeBuilding);
 
         // .tbx files go in a "buildings" subfolder next to the output TMX.
         // Named  X_Y_building_i.tbx  so multiple cells can share one folder.
@@ -430,26 +437,30 @@ public class run {
 
         String cellTag = cellX + "_" + cellY;  // used in tbx filenames
         List<String> lotEntries = new ArrayList<>();
-        for (BuildingData bd : buildings) {
-            String tbxName = cellTag + "_building_" + bd.index + ".tbx";
-            Path tbxPath   = buildingsDir.resolve(tbxName);
-            writeTbx(tbxPath, bd, header);
-            String relTbx;
-            try {
-                Path tmxDir = outPath.toAbsolutePath().getParent();
-                relTbx = tmxDir != null
-                       ? "./" + tmxDir.relativize(tbxPath.toAbsolutePath()).toString().replace('\\', '/')
-                       : "./buildings/" + tbxName;
-            } catch (Exception e) {
-                relTbx = "./buildings/" + tbxName;
+        if (!excludeBuilding) {
+            for (BuildingData bd : buildings) {
+                String tbxName = cellTag + "_building_" + bd.index + ".tbx";
+                Path tbxPath   = buildingsDir.resolve(tbxName);
+                writeTbx(tbxPath, bd, header);
+                String relTbx;
+                try {
+                    Path tmxDir = outPath.toAbsolutePath().getParent();
+                    relTbx = tmxDir != null
+                           ? "./" + tmxDir.relativize(tbxPath.toAbsolutePath()).toString().replace('\\', '/')
+                           : "./buildings/" + tbxName;
+                } catch (Exception e) {
+                    relTbx = "./buildings/" + tbxName;
+                }
+                lotEntries.add(relTbx + "|" + bd.ox + "|" + bd.oy + "|" + bd.bw + "|" + bd.bh);
             }
-            lotEntries.add(relTbx + "|" + bd.ox + "|" + bd.oy + "|" + bd.bw + "|" + bd.bh);
+            log("      " + buildings.size() + " building(s) written to " + buildingsDir);
+        } else {
+            log("      " + buildings.size() + " building(s) detected; skipping .tbx output (--excludebuilding).");
         }
-        log("      " + buildings.size() + " building(s) written to " + buildingsDir);
 
         // 5 — write TMX (building tiles already erased from 'tiles' by extractBuildings)
         log("[5/5] Writing " + outPath + " ...");
-        writeTmx(outPath, header, tiles, tilesetRegistry, tilesDirRegistry, lotEntries);
+        writeTmx(outPath, header, tiles, tilesetRegistry, tilesDirRegistry, lotEntries, excludeBuilding);
         return header;
     }
 
@@ -725,7 +736,7 @@ public class run {
     //   4. Build building-local room grid (for .tbx <rooms> CSV).
     // Returns list of BuildingData objects, one per building.
 
-    static List<BuildingData> extractBuildings(LotHeader header, int[][][][] tiles, int[][][] roomIds) {
+    static List<BuildingData> extractBuildings(LotHeader header, int[][][][] tiles, int[][][] roomIds, boolean excludeBuilding) {
         List<BuildingData> result = new ArrayList<>();
         int numLevels = header.numLevels;
         int cellH = roomIds[0].length;
@@ -905,15 +916,36 @@ public class run {
                         }
                         // Copy the 6 named sublayers into the building's tile store
                         // and erase them from the TMX grid (they go to the .tbx file).
+                        // When --excludebuilding is active the building tiles are erased
+                        // from the TMX just the same (no .tbx is written), but the lowest
+                        // Floor sublayer (sl==0) is *kept* in the TMX so that ground-level
+                        // floor surfaces remain visible after compaction.
                         for (int sl = 0; sl < NUM_SUBLAYERS; sl++) {
                             if (gy < tiles[z][sl].length && gx < tiles[z][sl][gy].length) {
                                 bd.buildingTiles[z][sl][by][bx] = tiles[z][sl][gy][gx];
-                                tiles[z][sl][gy][gx] = -1;  // erase from TMX grid
+                                // In --excludebuilding mode, preserve only the ground-level
+                                // Floor sublayer (z==0, sl==0) in the TMX so that the
+                                // terrain/ground surface is visible after the building is
+                                // removed.  Everything on upper levels (z>0) is erased
+                                // entirely — those are interior floors, walls, roof tiles
+                                // that have no meaning without the building structure.
+                                boolean keepInTmx = excludeBuilding && z == 0 && sl == 0;
+                                if (!keepInTmx) {
+                                    tiles[z][sl][gy][gx] = -1;  // erase from TMX grid
+                                }
                             }
                         }
                         // Overflow sublayers (slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1) are
                         // NOT copied to tbx and NOT erased — they stay in the TMX grid so
                         // no tile data is lost for squares that have >6 lotpack entries.
+                        // Exception: when --excludebuilding is active, erase overflow slots
+                        // too so no building data bleeds through on any layer.
+                        if (excludeBuilding) {
+                            for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
+                                if (gy < tiles[z][ovsl].length && gx < tiles[z][ovsl][gy].length)
+                                    tiles[z][ovsl][gy][gx] = -1;
+                            }
+                        }
                     }
                 }
             }
@@ -1757,7 +1789,8 @@ public class run {
     static void writeTmx(Path out, LotHeader header, int[][][][] tiles,
                          Map<String, TilesetInfo> tilesetRegistry,
                          Map<String, TilesetInfo> tilesDirRegistry,
-                         List<String> lotEntries) throws IOException {
+                         List<String> lotEntries,
+                         boolean excludeBuilding) throws IOException {
 
         int cellW = header.chunksX() * header.chunkW;
         int cellH = header.chunksY() * header.chunkH;
@@ -1988,6 +2021,9 @@ public class run {
         // <objectgroup name="0_Lots"> -- one <object name="lot"> per building.
         // lotheader rr->x is in tile-width (64px) units: pixel_x = tile_x * MAP_TILE_W (64)
         // lotheader rr->y is in tile-height (32px) units: pixel_y = tile_y * MAP_TILE_H (32)
+        // When --excludebuilding is active the entire 0_Lots group is omitted because
+        // there are no .tbx files to reference.
+        if (!excludeBuilding) {
         if (lotEntries.isEmpty()) {
             sb.append(" <objectgroup name=\"0_Lots\" width=\"300\" height=\"300\"/>\n");
         } else {
@@ -2007,6 +2043,7 @@ public class run {
             }
             sb.append(" </objectgroup>\n");
         }
+        } // end if (!excludeBuilding) for 0_Lots
 
 
         // <bmp-settings> — WorldEd terrain-generation metadata.
@@ -2338,8 +2375,17 @@ public class run {
 
     static Map<String, String> parseArgs(String[] args) {
         Map<String, String> m = new LinkedHashMap<>();
-        for (int i = 0; i < args.length - 1; i++)
-            if (args[i].startsWith("--")) m.put(args[i].substring(2), args[i + 1]);
+        for (int i = 0; i < args.length; i++) {
+            if (!args[i].startsWith("--")) continue;
+            String key = args[i].substring(2);
+            // Boolean flag: no following token, or next token is itself a flag.
+            if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+                m.put(key, "true");   // presence flag — value is irrelevant
+            } else {
+                m.put(key, args[i + 1]);
+                i++;  // consume the value token
+            }
+        }
         return m;
     }
 
