@@ -62,6 +62,10 @@
  *                                                  files; the lowest Floor sublayer of each building
  *                                                  tile is kept in the TMX so ground surfaces are
  *                                                  preserved after compaction)
+ *       --rule      <Rules.txt>               (optional: WorldEd Rules.txt — resolves aliases and
+ *                                                  re-assigns each tile to the sublayer declared in
+ *                                                  its matching rule, correcting any slot mismatches
+ *                                                  that arise from the lotpack encoding order)
  *   Without --tilesets or --tilesdir, tileset block sizes are computed from the tile
  *   names in the lotheader. The result is a self-consistent TMX that renders correctly
  *   in TileZed/WorldEd but may have different firstGid values from other cells.
@@ -148,7 +152,9 @@ public class run {
         List<String> roomNames = new ArrayList<>();   // index 1-based (index 0 = sentinel "")
         // tile data per level/sublayer within the bounding box
         // buildingTiles[z][sl][by][bx] = lotheader tileID (-1 = empty)
-        int[][][][] buildingTiles;  // [numLevels][NUM_SUBLAYERS][bh][bw]
+        // Slots 0..NUM_SUBLAYERS-1       = the 6 named sublayers (Floor..Vegetation)
+        // Slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1 = overflow entries (Extra0..Extra7)
+        int[][][][] buildingTiles;  // [numLevels][NUM_ALL_SUBLAYERS][bh+1][bw+1]
     }
 
     /**
@@ -207,6 +213,19 @@ public class run {
         Path tilesDir    = opts.containsKey("tilesdir") ? Path.of(opts.get("tilesdir")) : null;
         Path tilesetsRef = opts.containsKey("tilesets") ? Path.of(opts.get("tilesets")) : null;
         boolean excludeBuilding = opts.containsKey("excludebuilding");
+
+        // Optional Rules.txt: tile-name → target sublayer index.
+        // Parsed once here and passed through to every processCell call.
+        Map<String, Integer> rulesMap = new LinkedHashMap<>();
+        if (opts.containsKey("rule")) {
+            Path rulePath = Path.of(opts.get("rule"));
+            if (!Files.exists(rulePath)) {
+                System.err.println("WARNING: --rule file not found: " + rulePath + " — ignoring.");
+            } else {
+                rulesMap = parseRules(rulePath);
+                log("  Loaded rules: " + rulesMap.size() + " tile(s) mapped to sublayers from " + rulePath.getFileName());
+            }
+        }
 
         // ── Map-folder mode: process every cell found in the directory ─────────
         if (opts.containsKey("mapdir")) {
@@ -299,7 +318,7 @@ public class run {
                 Path outTmx = outDir.resolve("MyMap_" + cellTag + ".tmx");
                 try {
                     log("\n== Cell " + cellTag + " ==================================");
-                    LotHeader hdr = processCell(lh, lp, outTmx, tilesDir, tilesetsRef, excludeBuilding);
+                    LotHeader hdr = processCell(lh, lp, outTmx, tilesDir, tilesetsRef, excludeBuilding, rulesMap);
                     processedCells.add(cc);
                     if (hdr.spawnBytes.length == 900)
                         spawnDataMap.put(cellTag, hdr.spawnBytes);
@@ -338,6 +357,7 @@ public class run {
             System.err.println("    [--pzw      <project name, no extension, default: untitled>] \\\\");
             System.err.println("    [--objects  <objects.lua path, optional>]") ;
             System.err.println("    [--excludebuilding]                   (exclude building tiles from TMX; no .tbx output)");
+            System.err.println("    [--rule        <Rules.txt path, optional>]");
             System.err.println();
             System.err.println("Usage (single-cell file mode):");
             System.err.println("  java run.java \\");
@@ -351,7 +371,7 @@ public class run {
             return;
         }
         String outName = opts.getOrDefault("output", deriveOutputName(lotheaderPath));
-        processCell(lotheaderPath, lotpackPath, Path.of(outName), tilesDir, tilesetsRef, excludeBuilding);
+        processCell(lotheaderPath, lotpackPath, Path.of(outName), tilesDir, tilesetsRef, excludeBuilding, rulesMap);
         log("\nDone! Open " + outName + " in WorldEd / TileZed.");
     }
 
@@ -359,7 +379,8 @@ public class run {
 
     static LotHeader processCell(Path lotheaderPath, Path lotpackPath, Path outPath,
                             Path tilesDir, Path tilesetsRef,
-                            boolean excludeBuilding) throws Exception {
+                            boolean excludeBuilding,
+                            Map<String, Integer> rulesMap) throws Exception {
 
         // Parse cell coordinates from the lotheader filename: "X_Y.lotheader"
         int[] cellCoords = parseCellCoords(lotheaderPath.getFileName().toString());
@@ -420,6 +441,10 @@ public class run {
             for (int[] row : lv) Arrays.fill(row, -1);
         parseLotpack(lotpackPath, header, tiles, roomIds);
         log("      Grid decoded: " + cellW + " x " + cellH + " tiles");
+        if (!rulesMap.isEmpty()) {
+            int reassigned = applyRules(tiles, header, rulesMap);
+            log("      Rules applied: " + reassigned + " tile(s) reassigned to correct sublayer.");
+        }
 
         // 4 — extract buildings, write .tbx files, erase building tiles from grid
         // NOTE: lotheader room rects are ALWAYS in cell-local tile space [0,300).
@@ -462,6 +487,264 @@ public class run {
         log("[5/5] Writing " + outPath + " ...");
         writeTmx(outPath, header, tiles, tilesetRegistry, tilesDirRegistry, lotEntries, excludeBuilding);
         return header;
+    }
+
+    // ── Rules.txt parser ─────────────────────────────────────────────────────
+    //
+    // Parses a WorldEd Rules.txt file and returns a map of:
+    //   fully-qualified tile name  →  target sublayer index (0=Floor … 5=Vegetation)
+    //
+    // The file format has two block types:
+    //
+    //   alias { name = <id>  tiles = [ <tile> ... ] }
+    //     Declares a named set of tiles.  Aliases can reference other aliases.
+    //
+    //   rule  { ... tiles = <id-or-tile> | [ <id-or-tile> ... ]  layer = <layerName> ... }
+    //     Maps each listed tile (or every tile in a named alias, recursively) to
+    //     the sublayer identified by layerName (e.g. "0_Floor", "0_Vegetation").
+    //
+    // Only the SUBLAYERS known to the TMX writer are mapped; any unknown layer
+    // name is silently skipped so the method stays forward-compatible.
+    //
+    // Tile names in the file use underscores throughout (e.g. "blends_natural_01_56");
+    // these match the lotheader names exactly.
+
+    /** Parse layer name like "0_Floor", "0_FloorOverlay", "0_Vegetation" → SUBLAYERS index. */
+    static int layerNameToSlot(String layerName) {
+        // Strip the leading level prefix if present ("0_Floor" → "Floor")
+        String bare = layerName.contains("_") ? layerName.substring(layerName.indexOf('_') + 1) : layerName;
+        for (int i = 0; i < SUBLAYERS.length; i++)
+            if (SUBLAYERS[i].equalsIgnoreCase(bare)) return i;
+        return -1; // unknown / not a TMX sublayer we handle
+    }
+
+    /**
+     * Parse Rules.txt → tile-name-to-sublayer-index map.
+     * Aliases are fully resolved (transitively) before rules are applied.
+     */
+    static Map<String, Integer> parseRules(Path path) throws IOException {
+        String text = Files.readString(path);
+
+        // ── Step 1: collect aliases: name → list of raw tokens (may include alias refs) ──
+        Map<String, List<String>> aliasTokens = new LinkedHashMap<>();
+        {
+            // Match:  alias { name = <id>  tiles = [ <tok> ... ] }
+            // Use a brace-balanced scan rather than a regex to handle multi-line blocks.
+            int i = 0;
+            while (i < text.length()) {
+                int aIdx = text.indexOf("alias", i);
+                if (aIdx < 0) break;
+                // Find the opening brace of this alias block
+                int open = text.indexOf('{', aIdx);
+                if (open < 0) break;
+                int close = findClosingBrace(text, open);
+                if (close < 0) break;
+                String block = text.substring(open + 1, close);
+                i = close + 1;
+
+                String aName = extractField(block, "name");
+                if (aName == null) continue;
+
+                List<String> tokens = extractTileTokens(block);
+                aliasTokens.put(aName.trim(), tokens);
+            }
+        }
+
+        // ── Step 2: resolve aliases transitively → alias name → flat tile set ──
+        // We use memoisation to avoid re-expanding the same alias twice.
+        Map<String, Set<String>> resolvedAliases = new LinkedHashMap<>();
+        for (String aName : aliasTokens.keySet())
+            resolveAlias(aName, aliasTokens, resolvedAliases);
+
+        // ── Step 3: collect rules: each rule contributes (tile → slotIndex) ──
+        Map<String, Integer> result = new LinkedHashMap<>();
+        {
+            int i = 0;
+            while (i < text.length()) {
+                int rIdx = text.indexOf("rule", i);
+                if (rIdx < 0) break;
+                // Make sure this "rule" keyword is not inside a word (e.g. "rules")
+                // by checking the character immediately after.
+                int afterRule = rIdx + 4;
+                if (afterRule < text.length()) {
+                    char c = text.charAt(afterRule);
+                    if (Character.isLetterOrDigit(c) || c == '_') { i = afterRule; continue; }
+                }
+                int open = text.indexOf('{', rIdx);
+                if (open < 0) break;
+                int close = findClosingBrace(text, open);
+                if (close < 0) break;
+                String block = text.substring(open + 1, close);
+                i = close + 1;
+
+                String layerField = extractField(block, "layer");
+                if (layerField == null) continue;
+                int slot = layerNameToSlot(layerField.trim());
+                if (slot < 0) continue; // layer not handled by TMX writer
+
+                // Expand the tiles field: may be a single token or a [ ... ] list
+                List<String> tokens = extractTileTokens(block);
+                for (String tok : tokens) {
+                    tok = tok.trim();
+                    if (tok.isEmpty()) continue;
+                    if (resolvedAliases.containsKey(tok)) {
+                        // alias reference — map every tile it expands to
+                        for (String tile : resolvedAliases.get(tok))
+                            result.put(tile, slot);
+                    } else {
+                        // bare tile name
+                        result.put(tok, slot);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /** Find the index of the closing '}' matching the '{' at position open. */
+    static int findClosingBrace(String text, int open) {
+        int depth = 0;
+        for (int i = open; i < text.length(); i++) {
+            if (text.charAt(i) == '{') depth++;
+            else if (text.charAt(i) == '}') { depth--; if (depth == 0) return i; }
+        }
+        return -1;
+    }
+
+    /**
+     * Extract a simple  key = value  field from a block of text.
+     * Returns the trimmed value string, or null if the key is absent.
+     */
+    static String extractField(String block, String key) {
+        // Match:  key  =  value  (value ends at newline, comment, or next key)
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+            "\\b" + java.util.regex.Pattern.quote(key) + "\\s*=\\s*([^\\[\\]{}\n]+)");
+        java.util.regex.Matcher m = p.matcher(block);
+        return m.find() ? m.group(1).trim() : null;
+    }
+
+    /**
+     * Extract the tile token list from a block.
+     * Handles both:
+     *   tiles = singleToken
+     *   tiles = [ tok1  tok2  tok3 ]
+     * Tokens are whitespace/comma separated; comment lines (starting #) are stripped.
+     */
+    static List<String> extractTileTokens(String block) {
+        List<String> tokens = new ArrayList<>();
+        // Find  tiles = ...
+        java.util.regex.Pattern pField = java.util.regex.Pattern.compile(
+            "\\btiles\\s*=\\s*(\\[([^\\]]*)]|([^\\[\\]{}\\n]+))");
+        java.util.regex.Matcher mf = pField.matcher(block);
+        if (!mf.find()) return tokens;
+        // Group 2 = bracketed content, group 3 = bare single value
+        String raw = mf.group(2) != null ? mf.group(2) : mf.group(3);
+        if (raw == null) return tokens;
+        for (String line : raw.split("\\r?\\n")) {
+            line = line.trim();
+            if (line.startsWith("#") || line.isEmpty()) continue;
+            for (String tok : line.split("[,\\s]+")) {
+                tok = tok.trim();
+                if (!tok.isEmpty()) tokens.add(tok);
+            }
+        }
+        return tokens;
+    }
+
+    /**
+     * Recursively resolve an alias to the flat set of concrete tile names it covers.
+     * Uses memoisation (resolvedAliases) to avoid re-work and break cycles.
+     */
+    static Set<String> resolveAlias(String name,
+                                    Map<String, List<String>> aliasTokens,
+                                    Map<String, Set<String>> resolvedAliases) {
+        if (resolvedAliases.containsKey(name)) return resolvedAliases.get(name);
+        // Guard against cycles: put an empty set first
+        Set<String> out = new LinkedHashSet<>();
+        resolvedAliases.put(name, out);
+        List<String> tokens = aliasTokens.get(name);
+        if (tokens == null) { out.add(name); return out; } // treat unknown token as literal tile
+        for (String tok : tokens) {
+            tok = tok.trim();
+            if (tok.isEmpty()) continue;
+            if (aliasTokens.containsKey(tok)) {
+                // nested alias reference
+                out.addAll(resolveAlias(tok, aliasTokens, resolvedAliases));
+            } else {
+                out.add(tok);
+            }
+        }
+        return out;
+    }
+
+    // ── Rules applicator ──────────────────────────────────────────────────────
+    //
+    // After parseLotpack fills tiles[z][sl][y][x], the sublayer slot a tile
+    // landed in is purely determined by the order the PZ engine wrote entries —
+    // not by any semantic meaning.  For terrain cells this usually matches the
+    // TMX sublayer intent, but it is not guaranteed.
+    //
+    // applyRules walks every (z, y, x) square and, for each tile whose name
+    // appears in rulesMap, checks whether its current slot matches the target
+    // slot from the rules.  If not, it moves the tile to the target slot.
+    //
+    // Move strategy within a square:
+    //   - If the target slot is empty  → simple move (current slot → target slot).
+    //   - If the target slot is occupied → swap the two tiles.  The displaced tile
+    //     is then itself checked against the rules recursively (up to NUM_ALL_SUBLAYERS
+    //     iterations to guarantee termination even with cyclic swaps).
+    //
+    // Returns the total number of tile-slot reassignments performed (for logging).
+
+    static int applyRules(int[][][][] tiles, LotHeader header, Map<String, Integer> rulesMap) {
+        int numLevels = header.numLevels;
+        int cellH = tiles[0][0].length;
+        int cellW = tiles[0][0][0].length;
+        int totalMoved = 0;
+
+        for (int z = 0; z < numLevels; z++) {
+            for (int y = 0; y < cellH; y++) {
+                for (int x = 0; x < cellW; x++) {
+                    // Collect this square's current tile array (all slots) into a local
+                    // scratch buffer so we can reorder freely.
+                    int[] sq = new int[NUM_ALL_SUBLAYERS];
+                    for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++)
+                        sq[sl] = tiles[z][sl][y][x];
+
+                    // Iterative pass: keep re-scanning until no more moves are needed.
+                    // At most NUM_ALL_SUBLAYERS passes are required (each pass moves ≥1
+                    // tile to its correct slot and each tile can only be moved once to
+                    // its correct slot).
+                    boolean changed = true;
+                    int guard = NUM_ALL_SUBLAYERS;
+                    while (changed && guard-- > 0) {
+                        changed = false;
+                        for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++) {
+                            int tid = sq[sl];
+                            if (tid < 0 || tid >= header.tileNames.size()) continue;
+                            String name = header.tileNames.get(tid);
+                            Integer target = rulesMap.get(name);
+                            if (target == null || target == sl) continue;
+                            // This tile is in the wrong slot — move it to target.
+                            // Swap with whatever is in the target slot (may be -1).
+                            int displaced = sq[target];
+                            sq[target] = tid;
+                            sq[sl]     = displaced;
+                            totalMoved++;
+                            changed = true;
+                            // Don't break — continue scanning so the displaced tile
+                            // (now at sl) gets checked in the same pass if it also
+                            // has a rule.
+                        }
+                    }
+
+                    // Write the reordered square back.
+                    for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++)
+                        tiles[z][sl][y][x] = sq[sl];
+                }
+            }
+        }
+        return totalMoved;
     }
 
     // ── Tiles folder scanner ──────────────────────────────────────────────────
@@ -888,7 +1171,9 @@ public class run {
 
             // Tile grid is (bh+1) x (bw+1): the extra row (by==bh) holds south-wall tiles
             // and the extra col (bx==bw) holds east-wall tiles, matching the tbx tile CSV.
-            bd.buildingTiles = new int[numLevels][NUM_SUBLAYERS][bh + 1][bw + 1];
+            // All sublayer slots (named + overflow) are stored so overflow entries are
+            // also captured, erased from the TMX, and written to the .tbx.
+            bd.buildingTiles = new int[numLevels][NUM_ALL_SUBLAYERS][bh + 1][bw + 1];
             for (int[][][] lv : bd.buildingTiles)
                 for (int[][] sl : lv)
                     for (int[] row : sl)
@@ -935,15 +1220,19 @@ public class run {
                                 }
                             }
                         }
-                        // Overflow sublayers (slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1) are
-                        // NOT copied to tbx and NOT erased — they stay in the TMX grid so
-                        // no tile data is lost for squares that have >6 lotpack entries.
-                        // Exception: when --excludebuilding is active, erase overflow slots
-                        // too so no building data bleeds through on any layer.
-                        if (excludeBuilding) {
+                        // Overflow sublayers (slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1):
+                        // copy them into the building store and erase from the TMX grid,
+                        // matching the treatment of the 6 named sublayers above.
+                        // Previously these were left in the TMX, causing overflow tile data
+                        // that belongs to a building to bleed through as stray TMX layers.
+                        // Exception for --excludebuilding is handled by the erase-only path
+                        // that already ran above for that mode.
+                        if (!excludeBuilding) {
                             for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
-                                if (gy < tiles[z][ovsl].length && gx < tiles[z][ovsl][gy].length)
-                                    tiles[z][ovsl][gy][gx] = -1;
+                                if (gy < tiles[z][ovsl].length && gx < tiles[z][ovsl][gy].length) {
+                                    bd.buildingTiles[z][ovsl][by][bx] = tiles[z][ovsl][gy][gx];
+                                    tiles[z][ovsl][gy][gx] = -1;  // erase from TMX grid
+                                }
                             }
                         }
                     }
@@ -1016,9 +1305,11 @@ public class run {
         int bw = bd.bw, bh = bd.bh;
 
         // Collect all unique tile names used, in sorted order, to build user-tile list.
+        // Scan all sublayers including overflow (NUM_ALL_SUBLAYERS) so that tiles in
+        // Extra0..Extra7 layers are registered in the user-tile index.
         Set<String> usedSet = new LinkedHashSet<>();
         for (int z = 0; z < numLevels; z++)
-            for (int sl = 0; sl < NUM_SUBLAYERS; sl++)
+            for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++)
                 for (int by = 0; by <= bh; by++)
                     for (int bx = 0; bx <= bw; bx++) {
                         int tid = bd.buildingTiles[z][sl][by][bx];
@@ -1030,11 +1321,12 @@ public class run {
         Map<String, Integer> tileIdx = new HashMap<>(); // 1-based index in user_tiles
         for (int i = 0; i < userTileList.size(); i++) tileIdx.put(userTileList.get(i), i + 1);
 
-        // Highest floor level containing any tile data (to avoid emitting empty upper floors)
+        // Highest floor level containing any tile data (to avoid emitting empty upper floors).
+        // Check all sublayers including overflow.
         int maxFloor = 0;
         outerSearch:
         for (int z = numLevels - 1; z >= 0; z--)
-            for (int sl = 0; sl < NUM_SUBLAYERS; sl++)
+            for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++)
                 for (int by = 0; by <= bh; by++)
                     for (int bx = 0; bx <= bw; bx++)
                         if (bd.buildingTiles[z][sl][by][bx] >= 0) { maxFloor = z; break outerSearch; }
@@ -1108,6 +1400,33 @@ public class run {
                 for (int by = 0; by <= bh; by++) {
                     for (int bx = 0; bx <= bw; bx++) {
                         int tid = bd.buildingTiles[z][sl][by][bx];
+                        if (tid >= 0 && tid < header.tileNames.size()) {
+                            sb.append(tileIdx.getOrDefault(header.tileNames.get(tid), 0));
+                        } else {
+                            sb.append("0");
+                        }
+                        if (bx < tCols - 1 || by < tRows - 1) sb.append(",");
+                    }
+                    sb.append("\n");
+                }
+                sb.append("  </tiles>\n");
+            }
+            // Overflow sublayers (Extra0..Extra7): emit as additional <tiles> layers
+            // using the same "UserExtra0" … naming convention so TileZed can round-trip them.
+            for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
+                boolean hasData = false;
+                outer2:
+                for (int by = 0; by <= bh && !hasData; by++)
+                    for (int bx = 0; bx <= bw && !hasData; bx++)
+                        if (bd.buildingTiles[z][ovsl][by][bx] >= 0) { hasData = true; break outer2; }
+                if (!hasData) continue;
+
+                String extraLayerName = "UserExtra" + (ovsl - NUM_SUBLAYERS);
+                sb.append("  <tiles layer=\"").append(extraLayerName).append("\">\n");
+                int tRows = bh + 1, tCols = bw + 1;
+                for (int by = 0; by <= bh; by++) {
+                    for (int bx = 0; bx <= bw; bx++) {
+                        int tid = bd.buildingTiles[z][ovsl][by][bx];
                         if (tid >= 0 && tid < header.tileNames.size()) {
                             sb.append(tileIdx.getOrDefault(header.tileNames.get(tid), 0));
                         } else {
