@@ -66,6 +66,12 @@
  *                                                  re-assigns each tile to the sublayer declared in
  *                                                  its matching rule, correcting any slot mismatches
  *                                                  that arise from the lotpack encoding order)
+ *       --tilezedconfig <config-folder>         (optional: TileZed config folder containing
+ *                                                  TMXConfig.txt, BuildingTiles.txt,
+ *                                                  BuildingTemplates.txt, and BuildingFurniture.txt;
+ *                                                  used to assign each building tile to the correct
+ *                                                  named .tbx layer instead of relying on lotpack
+ *                                                  sublayer slot order)
  *   Without --tilesets or --tilesdir, tileset block sizes are computed from the tile
  *   names in the lotheader. The result is a self-consistent TMX that renders correctly
  *   in TileZed/WorldEd but may have different firstGid values from other cells.
@@ -214,6 +220,25 @@ public class run {
         Path tilesetsRef = opts.containsKey("tilesets") ? Path.of(opts.get("tilesets")) : null;
         boolean excludeBuilding = opts.containsKey("excludebuilding");
 
+        // Optional TileZed config folder: tile-name → TBX layer name.
+        // Loaded once here and passed through to every writeTbx call.
+        TileZedConfig tzConfig = null;
+        if (opts.containsKey("tilezedconfig")) {
+            Path cfgDir = Path.of(opts.get("tilezedconfig"));
+            if (!Files.isDirectory(cfgDir)) {
+                System.err.println("WARNING: --tilezedconfig is not a directory: " + cfgDir + " — ignoring.");
+            } else {
+                try {
+                    tzConfig = parseTileZedConfig(cfgDir);
+                    log("  TileZed config loaded: " + tzConfig.tileToLayer.size()
+                        + " tile(s) mapped to layers, "
+                        + tzConfig.layerNames.size() + " layer(s) from " + cfgDir);
+                } catch (Exception e) {
+                    System.err.println("WARNING: Could not parse --tilezedconfig: " + e.getMessage() + " — ignoring.");
+                }
+            }
+        }
+
         // Optional Rules.txt: tile-name → target sublayer index.
         // Parsed once here and passed through to every processCell call.
         Map<String, Integer> rulesMap = new LinkedHashMap<>();
@@ -318,7 +343,7 @@ public class run {
                 Path outTmx = outDir.resolve("MyMap_" + cellTag + ".tmx");
                 try {
                     log("\n== Cell " + cellTag + " ==================================");
-                    LotHeader hdr = processCell(lh, lp, outTmx, tilesDir, tilesetsRef, excludeBuilding, rulesMap);
+                    LotHeader hdr = processCell(lh, lp, outTmx, tilesDir, tilesetsRef, excludeBuilding, rulesMap, tzConfig);
                     processedCells.add(cc);
                     if (hdr.spawnBytes.length == 900)
                         spawnDataMap.put(cellTag, hdr.spawnBytes);
@@ -358,6 +383,7 @@ public class run {
             System.err.println("    [--objects  <objects.lua path, optional>]") ;
             System.err.println("    [--excludebuilding]                   (exclude building tiles from TMX; no .tbx output)");
             System.err.println("    [--rule        <Rules.txt path, optional>]");
+            System.err.println("    [--tilezedconfig <TileZed config folder, optional>]");
             System.err.println();
             System.err.println("Usage (single-cell file mode):");
             System.err.println("  java run.java \\");
@@ -371,7 +397,7 @@ public class run {
             return;
         }
         String outName = opts.getOrDefault("output", deriveOutputName(lotheaderPath));
-        processCell(lotheaderPath, lotpackPath, Path.of(outName), tilesDir, tilesetsRef, excludeBuilding, rulesMap);
+        processCell(lotheaderPath, lotpackPath, Path.of(outName), tilesDir, tilesetsRef, excludeBuilding, rulesMap, tzConfig);
         log("\nDone! Open " + outName + " in WorldEd / TileZed.");
     }
 
@@ -380,7 +406,8 @@ public class run {
     static LotHeader processCell(Path lotheaderPath, Path lotpackPath, Path outPath,
                             Path tilesDir, Path tilesetsRef,
                             boolean excludeBuilding,
-                            Map<String, Integer> rulesMap) throws Exception {
+                            Map<String, Integer> rulesMap,
+                            TileZedConfig tzConfig) throws Exception {
 
         // Parse cell coordinates from the lotheader filename: "X_Y.lotheader"
         int[] cellCoords = parseCellCoords(lotheaderPath.getFileName().toString());
@@ -466,7 +493,7 @@ public class run {
             for (BuildingData bd : buildings) {
                 String tbxName = cellTag + "_building_" + bd.index + ".tbx";
                 Path tbxPath   = buildingsDir.resolve(tbxName);
-                writeTbx(tbxPath, bd, header);
+                writeTbx(tbxPath, bd, header, tzConfig);
                 String relTbx;
                 try {
                     Path tmxDir = outPath.toAbsolutePath().getParent();
@@ -1293,9 +1320,245 @@ public class run {
 
     // Mapping from lotpack sublayer index -> .tbx layer name (6 sublayers).
     // sublayer 0=Floor  1=Walls  2=Walls2  3=Frames  4=Furniture  5=Vegetation
+    // Used as the fallback when no --tilezedconfig is supplied.
     static final String[] TBX_LAYERS = {
         "Floor", "Walls", "Walls2", "Frames", "Furniture", "Vegetation"
     };
+
+    // ── TileZed config ────────────────────────────────────────────────────────
+
+    /**
+     * Parsed result of a TileZed config folder.
+     *
+     * layerNames  — ordered list of TBX layer names from TMXConfig.txt
+     *               (e.g. ["Floor","FloorOverlay","FloorGrime",...,"RoofTop"])
+     * tileToLayer — tile name → TBX layer name, built from:
+     *                 BuildingTiles.txt    (category → layer mapping)
+     *                 BuildingTemplates.txt (TileEntry category= → same mapping)
+     *                 BuildingFurniture.txt (all furniture tiles → "Furniture")
+     */
+    static class TileZedConfig {
+        List<String>        layerNames  = new ArrayList<>();   // TMXConfig layer order
+        Map<String, String> tileToLayer = new LinkedHashMap<>(); // tile name → layer name
+    }
+
+    /**
+     * Maps BuildingTiles.txt category internal names to the canonical TBX layer name.
+     * Derived by cross-referencing the category semantics with the TMXConfig layer list.
+     */
+    static String categoryToTbxLayer(String categoryName) {
+        switch (categoryName) {
+            case "exterior_walls":     return "Walls";
+            case "interior_walls":     return "Walls2";
+            case "exterior_wall_trim": return "WallTrim";
+            case "interior_wall_trim": return "WallTrim2";
+            case "floors":             return "Floor";
+            case "doors":              return "Doors";
+            case "door_frames":        return "Frames";
+            case "windows":            return "Windows";
+            case "curtains":           return "Curtains";
+            // Shutters go to WallFurniture (confirmed from buildingfloor.cpp:
+            // ReplaceShutters calls ReplaceFurniture(..., SectionWallFurniture, SectionWallFurniture2))
+            case "shutters":           return "WallFurniture";
+            case "stairs":             return "Furniture";
+            case "grime_floor":        return "FloorGrime";
+            case "grime_wall":         return "WallGrime";
+            case "roof_caps":          return "RoofCap";
+            case "roof_slopes":        return "Roof";
+            case "roof_tops":          return "RoofTop";
+            default:                   return null;  // unknown category
+        }
+    }
+
+    /**
+     * Parse a TileZed config folder and return a TileZedConfig.
+     *
+     * Files read (all optional — missing files are silently skipped):
+     *   TMXConfig.txt        → layerNames list
+     *   BuildingTiles.txt    → category entries → tile → layer
+     *   BuildingTemplates.txt→ TileEntry blocks → tile → layer
+     *   BuildingFurniture.txt→ furniture blocks with explicit layer= → tile → that layer
+     *                          furniture blocks with no layer=       → tile → "Furniture"
+     */
+    static TileZedConfig parseTileZedConfig(Path dir) throws IOException {
+        TileZedConfig cfg = new TileZedConfig();
+
+        // ── 1. TMXConfig.txt → ordered layer name list ────────────────────────
+        Path tmxCfg = dir.resolve("TMXConfig.txt");
+        if (Files.isRegularFile(tmxCfg)) {
+            for (String line : Files.readAllLines(tmxCfg)) {
+                line = line.trim();
+                if (line.startsWith("tile = ")) {
+                    String layerName = line.substring("tile = ".length()).trim();
+                    if (!layerName.isEmpty()) cfg.layerNames.add(layerName);
+                }
+            }
+        }
+
+        // ── 2. BuildingTiles.txt → tile name → layer ─────────────────────────
+        // Format:  category { name = <cat>  entry { Key = tileName ... } ... }
+        // We parse each category block, resolve its layer, then collect every
+        // tile name that appears as a value in any entry key.
+        Path btPath = dir.resolve("BuildingTiles.txt");
+        if (Files.isRegularFile(btPath)) {
+            String text = Files.readString(btPath);
+            int i = 0;
+            while (i < text.length()) {
+                int catIdx = text.indexOf("category", i);
+                if (catIdx < 0) break;
+                // skip if inside a word
+                if (catIdx > 0 && (Character.isLetterOrDigit(text.charAt(catIdx - 1))
+                        || text.charAt(catIdx - 1) == '_')) { i = catIdx + 1; continue; }
+                int open = text.indexOf('{', catIdx);
+                if (open < 0) break;
+                int close = findClosingBrace(text, open);
+                if (close < 0) break;
+                String block = text.substring(open + 1, close);
+                i = close + 1;
+
+                String catName = extractField(block, "name");
+                if (catName == null) continue;
+                catName = catName.trim();
+                String layerName = categoryToTbxLayer(catName);
+                if (layerName == null) continue;
+
+                // Collect all  Key = tileValue  pairs inside entry blocks.
+                collectTileValues(block, layerName, cfg.tileToLayer);
+            }
+        }
+
+        // ── 3. BuildingTemplates.txt → tile name → layer ──────────────────────
+        // Format:  TileEntry { category = <cat>  Key = tileName ... }
+        Path btmpl = dir.resolve("BuildingTemplates.txt");
+        if (Files.isRegularFile(btmpl)) {
+            String text = Files.readString(btmpl);
+            int i = 0;
+            while (i < text.length()) {
+                int teIdx = text.indexOf("TileEntry", i);
+                if (teIdx < 0) break;
+                int open = text.indexOf('{', teIdx);
+                if (open < 0) break;
+                int close = findClosingBrace(text, open);
+                if (close < 0) break;
+                String block = text.substring(open + 1, close);
+                i = close + 1;
+
+                String catName = extractField(block, "category");
+                if (catName == null) continue;
+                catName = catName.trim();
+                String layerName = categoryToTbxLayer(catName);
+                if (layerName == null) continue;
+
+                collectTileValues(block, layerName, cfg.tileToLayer);
+            }
+        }
+
+        // ── 4. BuildingFurniture.txt → tile name → layer ──────────────────────
+        // Format:  group { label=...  furniture { [layer = LayerName]  entry { orient=..  row,col = tileName } } }
+        // Each furniture block may carry an optional  layer = X  field.
+        // When present, every tile in that block is assigned to that layer.
+        // When absent, tiles fall back to "Furniture" (the most common case).
+        // The layer= field (if any) appears at the top of the furniture block,
+        // before any entry sub-blocks.
+        Path bfurn = dir.resolve("BuildingFurniture.txt");
+        if (Files.isRegularFile(bfurn)) {
+            String text = Files.readString(bfurn);
+            int i = 0;
+            while (i < text.length()) {
+                int furIdx = text.indexOf("furniture", i);
+                if (furIdx < 0) break;
+                // skip if part of a longer word
+                if (furIdx > 0 && (Character.isLetterOrDigit(text.charAt(furIdx - 1))
+                        || text.charAt(furIdx - 1) == '_')) { i = furIdx + 1; continue; }
+                int afterKw = furIdx + "furniture".length();
+                if (afterKw < text.length() && (Character.isLetterOrDigit(text.charAt(afterKw))
+                        || text.charAt(afterKw) == '_')) { i = afterKw; continue; }
+                int open = text.indexOf('{', furIdx);
+                if (open < 0) break;
+                int close = findClosingBrace(text, open);
+                if (close < 0) break;
+                String block = text.substring(open + 1, close);
+                i = close + 1;
+
+                // Determine the layer for this furniture block.
+                // extractField matches the first "layer = X" line in the block
+                // (which appears before any entry sub-blocks).
+                String explicitLayer = extractField(block, "layer");
+                String furnitureLayer = (explicitLayer != null && !explicitLayer.trim().isEmpty())
+                        ? explicitLayer.trim()
+                        : "Furniture";
+
+                // Collect grid-position tile entries: lines of the form  N,N = tileName
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("^\\s*\\d+,\\d+\\s*=\\s*(\\S+)", java.util.regex.Pattern.MULTILINE)
+                        .matcher(block);
+                while (m.find()) {
+                    String tileName = normaliseTileName(m.group(1).trim());
+                    if (!tileName.isEmpty())
+                        cfg.tileToLayer.putIfAbsent(tileName, furnitureLayer);
+                }
+            }
+        }
+
+        return cfg;
+    }
+
+    /**
+     * Normalise a tile name from the config files to match the format used in
+     * lotheader tile name lists.
+     *
+     * Config files (BuildingTiles.txt, BuildingFurniture.txt, etc.) store tile
+     * names with a zero-padded 3-digit suffix, e.g. "walls_commercial_01_016".
+     * Lotheader tile names use the un-padded form, e.g. "walls_commercial_01_16".
+     * Without normalisation every lookup in tileToLayer fails silently.
+     *
+     * Rule: strip leading zeros from the final numeric segment only.
+     *   "overlay_grime_floor_01_000" → "overlay_grime_floor_01_0"
+     *   "fixtures_doors_01_016"      → "fixtures_doors_01_16"
+     *   "blends_natural_01_56"       → "blends_natural_01_56"  (no change, already un-padded)
+     */
+    static String normaliseTileName(String name) {
+        int us = name.lastIndexOf('_');
+        if (us < 0) return name;
+        String suffix = name.substring(us + 1);
+        // Only normalise if the suffix is purely numeric
+        if (!suffix.matches("\\d+")) return name;
+        // Strip leading zeros but keep at least one digit
+        String stripped = suffix.replaceFirst("^0+(?=\\d)", "");
+        if (stripped.equals(suffix)) return name; // no change needed
+        return name.substring(0, us + 1) + stripped;
+    }
+
+    /**
+     * Scan a text block for  Key = tileValue  lines (where tileValue looks like a
+     * tile name: alphanumeric + underscores, ending with _NNN) and register each
+     * non-empty value in tileToLayer, giving it the supplied layerName.
+     * Already-registered tiles are NOT overwritten (first assignment wins).
+     * Tile names are normalised (zero-padded suffix stripped) before insertion.
+     */
+    static void collectTileValues(String block, String layerName,
+                                  Map<String, String> tileToLayer) {
+        // Match lines: optional-whitespace  Word = Value  (Value is non-empty, no spaces)
+        // "Word" is the semantic key (West, North, Floor, WestOpen, …); value is the tile name.
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+            "^\\s*[A-Za-z]\\w*\\s*=\\s*(\\S+)", java.util.regex.Pattern.MULTILINE);
+        java.util.regex.Matcher m = p.matcher(block);
+        // Exclude meta-keys that are NOT tile names: "label", "name", "version", "revision"
+        java.util.regex.Pattern metaKey = java.util.regex.Pattern.compile(
+            "^\\s*(label|name|version|revision|source_revision)\\s*=",
+            java.util.regex.Pattern.MULTILINE);
+        while (m.find()) {
+            // Check that the key is NOT a meta-field by inspecting the full line
+            String fullLine = m.group(0);
+            if (metaKey.matcher(fullLine).find()) continue;
+            String tileName = m.group(1).trim();
+            if (tileName.isEmpty()) continue;
+            // Tile names always contain an underscore (e.g. "walls_exterior_01_000");
+            // skip plain words that are values of meta fields that slipped through.
+            if (!tileName.contains("_")) continue;
+            tileToLayer.putIfAbsent(normaliseTileName(tileName), layerName);
+        }
+    }
 
     // ── .tbx writer ──────────────────────────────────────────────────────────
     // Format confirmed from Lost_Church.tbx / buildingwriter.cpp:
@@ -1303,13 +1566,20 @@ public class run {
     //  - Rooms CSV:  bh rows x bw cols, trailing comma per row
     //  - Tiles CSV:  (bh+1) rows x (bw+1) cols, trailing comma per row
     //  - Element order: user_tiles > used_tiles > used_furniture > room* > floor*
-    static void writeTbx(Path out, BuildingData bd, LotHeader header) throws IOException {
+    //
+    // When tzConfig is non-null the output uses config-driven layer assignment:
+    //   - The ordered layer list comes from TMXConfig.txt (tzConfig.layerNames).
+    //   - Each tile is placed in the layer dictated by tzConfig.tileToLayer.
+    //   - Tiles not found in the map fall back to TBX_LAYERS[slot] as before.
+    //   - All tiles across ALL sublayer slots (named + overflow) are merged into
+    //     the correct named layer, eliminating phantom "UserExtra" layers.
+    // When tzConfig is null the original slot-indexed behaviour is used.
+    static void writeTbx(Path out, BuildingData bd, LotHeader header,
+                         TileZedConfig tzConfig) throws IOException {
         int numLevels = header.numLevels;
         int bw = bd.bw, bh = bd.bh;
 
         // Collect all unique tile names used, in sorted order, to build user-tile list.
-        // Scan all sublayers including overflow (NUM_ALL_SUBLAYERS) so that tiles in
-        // Extra0..Extra7 layers are registered in the user-tile index.
         Set<String> usedSet = new LinkedHashSet<>();
         for (int z = 0; z < numLevels; z++)
             for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++)
@@ -1325,7 +1595,6 @@ public class run {
         for (int i = 0; i < userTileList.size(); i++) tileIdx.put(userTileList.get(i), i + 1);
 
         // Highest floor level containing any tile data (to avoid emitting empty upper floors).
-        // Check all sublayers including overflow.
         int maxFloor = 0;
         outerSearch:
         for (int z = numLevels - 1; z >= 0; z--)
@@ -1333,6 +1602,23 @@ public class run {
                 for (int by = 0; by <= bh; by++)
                     for (int bx = 0; bx <= bw; bx++)
                         if (bd.buildingTiles[z][sl][by][bx] >= 0) { maxFloor = z; break outerSearch; }
+
+        // ── Determine the effective layer list ────────────────────────────────
+        // With tzConfig: use the ordered layer names from TMXConfig.txt, then
+        // append "Unidentified" as a catch-all for tiles not found in any config.
+        // Without: fall back to the 6 hardcoded slot names + UserExtraN for overflow.
+        List<String> effectiveLayerNames;
+        if (tzConfig != null && !tzConfig.layerNames.isEmpty()) {
+            effectiveLayerNames = new ArrayList<>(tzConfig.layerNames);
+            // Always append Unidentified so tiles absent from all config files have
+            // a named home rather than being silently dropped.
+            if (!effectiveLayerNames.contains("Unidentified"))
+                effectiveLayerNames.add("Unidentified");
+        } else {
+            effectiveLayerNames = new ArrayList<>(Arrays.asList(TBX_LAYERS));
+            for (int ov = 0; ov < OVERFLOW_SUBLAYERS; ov++)
+                effectiveLayerNames.add("UserExtra" + ov);
+        }
 
         StringBuilder sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -1345,7 +1631,7 @@ public class run {
             sb.append(" ").append(attr).append("=\"0\"");
         sb.append(">\n");
 
-        // <user_tiles> — comes before rooms and floors (buildingwriter.cpp order)
+        // <user_tiles>
         sb.append(" <user_tiles>\n");
         for (String tname : userTileList)
             sb.append("  <tile tile=\"").append(xmlEsc(tname)).append("\"/>\n");
@@ -1353,7 +1639,7 @@ public class run {
         sb.append(" <used_tiles></used_tiles>\n");
         sb.append(" <used_furniture></used_furniture>\n");
 
-        // <room> elements (1-based from bd.roomNames; index 0 is the null-room placeholder)
+        // <room> elements
         int[][] ROOM_COLORS = {
             {200,100,100}, {100,200,100}, {100,100,200},
             {200,200,100}, {200,100,200}, {100,200,200},
@@ -1373,9 +1659,7 @@ public class run {
         for (int z = 0; z <= maxFloor; z++) {
             sb.append(" <floor>\n");
 
-            // <rooms> CSV: bh rows x bw cols.
-            // Trailing comma on every row EXCEPT the last (buildingreader.cpp counts commas,
-            // a trailing comma on the last row causes y to exceed floor->height() → "Corrupt").
+            // <rooms> CSV
             sb.append("  <rooms>\n");
             for (int by = 0; by < bh; by++) {
                 for (int bx = 0; bx < bw; bx++) {
@@ -1386,60 +1670,113 @@ public class run {
             }
             sb.append("  </rooms>\n");
 
-            // <tiles layer="..."> for each sublayer with data
-            // Grid: (bh+1) rows x (bw+1) cols — the extra row (by==bh) holds south-wall tiles
-            // and the extra col (bx==bw) holds east-wall tiles.
-            // Same rule: no trailing comma on the very last value.
-            for (int sl = 0; sl < NUM_SUBLAYERS; sl++) {
-                boolean hasData = false;
-                outer:
-                for (int by = 0; by <= bh && !hasData; by++)
-                    for (int bx = 0; bx <= bw && !hasData; bx++)
-                        if (bd.buildingTiles[z][sl][by][bx] >= 0) { hasData = true; break outer; }
-                if (!hasData) continue;
-
-                sb.append("  <tiles layer=\"").append(TBX_LAYERS[sl]).append("\">\n");
+            if (tzConfig != null && !tzConfig.layerNames.isEmpty()) {
+                // ── Config-driven mode ────────────────────────────────────────
+                // For each named layer in TMXConfig order, collect every tile
+                // (from ALL sublayer slots) whose name maps to that layer.
+                // Grid is (bh+1) × (bw+1); a cell gets the value of the first
+                // matching tile found across all slots (named slots first, then
+                // overflow slots in order) so that the most semantically
+                // significant assignment wins.
                 int tRows = bh + 1, tCols = bw + 1;
-                for (int by = 0; by <= bh; by++) {
-                    for (int bx = 0; bx <= bw; bx++) {
-                        int tid = bd.buildingTiles[z][sl][by][bx];
-                        if (tid >= 0 && tid < header.tileNames.size()) {
-                            sb.append(tileIdx.getOrDefault(header.tileNames.get(tid), 0));
-                        } else {
-                            sb.append("0");
-                        }
-                        if (bx < tCols - 1 || by < tRows - 1) sb.append(",");
-                    }
-                    sb.append("\n");
-                }
-                sb.append("  </tiles>\n");
-            }
-            // Overflow sublayers (Extra0..Extra7): emit as additional <tiles> layers
-            // using the same "UserExtra0" … naming convention so TileZed can round-trip them.
-            for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
-                boolean hasData = false;
-                outer2:
-                for (int by = 0; by <= bh && !hasData; by++)
-                    for (int bx = 0; bx <= bw && !hasData; bx++)
-                        if (bd.buildingTiles[z][ovsl][by][bx] >= 0) { hasData = true; break outer2; }
-                if (!hasData) continue;
+                for (String layerName : effectiveLayerNames) {
+                    // Build the output grid for this layer.
+                    int[][] layerGrid = new int[tRows][tCols];
+                    for (int[] row : layerGrid) Arrays.fill(row, 0); // 0 = empty
 
-                String extraLayerName = "UserExtra" + (ovsl - NUM_SUBLAYERS);
-                sb.append("  <tiles layer=\"").append(extraLayerName).append("\">\n");
-                int tRows = bh + 1, tCols = bw + 1;
-                for (int by = 0; by <= bh; by++) {
-                    for (int bx = 0; bx <= bw; bx++) {
-                        int tid = bd.buildingTiles[z][ovsl][by][bx];
-                        if (tid >= 0 && tid < header.tileNames.size()) {
-                            sb.append(tileIdx.getOrDefault(header.tileNames.get(tid), 0));
-                        } else {
-                            sb.append("0");
+                    boolean anyData = false;
+                    for (int by = 0; by <= bh; by++) {
+                        for (int bx = 0; bx <= bw; bx++) {
+                            // Scan all slots; assign to this layer if the tile maps here.
+                            for (int sl = 0; sl < NUM_ALL_SUBLAYERS; sl++) {
+                                int tid = bd.buildingTiles[z][sl][by][bx];
+                                if (tid < 0 || tid >= header.tileNames.size()) continue;
+                                String tname = header.tileNames.get(tid);
+                                // Determine target layer for this tile:
+                                //  1. tzConfig.tileToLayer lookup (config-driven, preferred)
+                                //  2. fallback for tiles not in the config map:
+                                //     - named slots (sl < TBX_LAYERS.length): use TBX_LAYERS[sl]
+                                //       so that the positional slot meaning is preserved for
+                                //       tiles that were never registered in any config file.
+                                //     - overflow slots: use "Unidentified" so the tile appears
+                                //       in the catch-all layer rather than being silently dropped.
+                                String targetLayer = tzConfig.tileToLayer.get(tname);
+                                if (targetLayer == null) {
+                                    if (sl < TBX_LAYERS.length)
+                                        targetLayer = TBX_LAYERS[sl];
+                                    else
+                                        targetLayer = "Unidentified";
+                                }
+                                if (!layerName.equals(targetLayer)) continue;
+                                // This tile belongs to the current layer.
+                                if (layerGrid[by][bx] == 0) { // first-match wins
+                                    layerGrid[by][bx] = tileIdx.getOrDefault(tname, 0);
+                                    if (layerGrid[by][bx] != 0) anyData = true;
+                                }
+                            }
                         }
-                        if (bx < tCols - 1 || by < tRows - 1) sb.append(",");
                     }
-                    sb.append("\n");
+
+                    if (!anyData) continue;
+
+                    sb.append("  <tiles layer=\"").append(xmlEsc(layerName)).append("\">\n");
+                    for (int by = 0; by <= bh; by++) {
+                        for (int bx = 0; bx <= bw; bx++) {
+                            sb.append(layerGrid[by][bx]);
+                            if (bx < tCols - 1 || by < tRows - 1) sb.append(",");
+                        }
+                        sb.append("\n");
+                    }
+                    sb.append("  </tiles>\n");
                 }
-                sb.append("  </tiles>\n");
+
+            } else {
+                // ── Slot-indexed fallback (no tzConfig) ───────────────────────
+                // Named sublayers (slots 0..NUM_SUBLAYERS-1) → TBX_LAYERS name.
+                for (int sl = 0; sl < NUM_SUBLAYERS; sl++) {
+                    boolean hasData = false;
+                    outer:
+                    for (int by = 0; by <= bh && !hasData; by++)
+                        for (int bx = 0; bx <= bw && !hasData; bx++)
+                            if (bd.buildingTiles[z][sl][by][bx] >= 0) { hasData = true; break outer; }
+                    if (!hasData) continue;
+
+                    sb.append("  <tiles layer=\"").append(TBX_LAYERS[sl]).append("\">\n");
+                    int tRows = bh + 1, tCols = bw + 1;
+                    for (int by = 0; by <= bh; by++) {
+                        for (int bx = 0; bx <= bw; bx++) {
+                            int tid = bd.buildingTiles[z][sl][by][bx];
+                            sb.append(tid >= 0 && tid < header.tileNames.size()
+                                ? tileIdx.getOrDefault(header.tileNames.get(tid), 0) : 0);
+                            if (bx < tCols - 1 || by < tRows - 1) sb.append(",");
+                        }
+                        sb.append("\n");
+                    }
+                    sb.append("  </tiles>\n");
+                }
+                // Overflow sublayers (slots NUM_SUBLAYERS..NUM_ALL_SUBLAYERS-1).
+                for (int ovsl = NUM_SUBLAYERS; ovsl < NUM_ALL_SUBLAYERS; ovsl++) {
+                    boolean hasData = false;
+                    outer2:
+                    for (int by = 0; by <= bh && !hasData; by++)
+                        for (int bx = 0; bx <= bw && !hasData; bx++)
+                            if (bd.buildingTiles[z][ovsl][by][bx] >= 0) { hasData = true; break outer2; }
+                    if (!hasData) continue;
+
+                    String extraLayerName = "UserExtra" + (ovsl - NUM_SUBLAYERS);
+                    sb.append("  <tiles layer=\"").append(extraLayerName).append("\">\n");
+                    int tRows = bh + 1, tCols = bw + 1;
+                    for (int by = 0; by <= bh; by++) {
+                        for (int bx = 0; bx <= bw; bx++) {
+                            int tid = bd.buildingTiles[z][ovsl][by][bx];
+                            sb.append(tid >= 0 && tid < header.tileNames.size()
+                                ? tileIdx.getOrDefault(header.tileNames.get(tid), 0) : 0);
+                            if (bx < tCols - 1 || by < tRows - 1) sb.append(",");
+                        }
+                        sb.append("\n");
+                    }
+                    sb.append("  </tiles>\n");
+                }
             }
 
             sb.append(" </floor>\n");
